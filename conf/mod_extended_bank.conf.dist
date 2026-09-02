@@ -1,0 +1,52 @@
+#
+# Copyright (C) 2026 odt1
+#
+# Released under the GNU General Public License v2, the same licence as
+# AzerothCore. See LICENSE in the root of this repository.
+#
+
+[worldserver]
+
+########################################
+# mod-extended-bank configuration
+########################################
+#
+#    ExtendedBank.Enable
+#        Description: Master switch. When disabled, banker NPCs behave exactly like
+#                     stock AzerothCore and the module touches nothing.
+#        Default:     1 - Enabled
+#                     0 - Disabled
+#
+#        Hot-reloadable with `.reload config`.
+#
+
+ExtendedBank.Enable = 1
+
+#
+#    ExtendedBank.MaxVaults
+#        Description: Total number of vaults a character may own, including the
+#                     vanilla bank (vault 1). A value of 8 therefore allows 7
+#                     purchasable vaults.
+#                     Lowering this below a character's owned vault count never
+#                     hides or deletes vaults; it only blocks further purchases.
+#        Range:       1 - 20
+#        Default:     8
+#
+#        Hot-reloadable with `.reload config`.
+#
+
+ExtendedBank.MaxVaults = 8
+
+#
+#    ExtendedBank.VaultCost
+#        Description: Comma-separated purchase price in GOLD for each vault beyond
+#                     the first. The first value is the price of vault 2, the
+#                     second of vault 3, and so on.
+#                     If the list is shorter than MaxVaults - 1, the last value is
+#                     reused for every remaining vault.
+#        Default:     "100,1000,2500,6000,18000,38000,90000"
+#
+#        Hot-reloadable with `.reload config`.
+#
+
+ExtendedBank.VaultCost = "100,1000,2500,6000,18000,38000,90000"
