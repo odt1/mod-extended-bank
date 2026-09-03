@@ -127,12 +127,29 @@ void ExtendedBankMgr::ForgetPlayer(ObjectGuid playerGuid)
 
 void ExtendedBankMgr::SelfHealVaultRows(ObjectGuid::LowType lowGuid)
 {
-    // An unclean shutdown can leave an item listed in a vault while the core has since given
-    // it a real character_inventory position. character_inventory always wins.
+    // An unclean shutdown can leave an item listed in a vault while it has since gone somewhere
+    // the core owns. Anywhere else always wins: a vault row is only a position, whereas every
+    // table below is the item genuinely being somewhere, and leaving the row would let
+    // AttachVault load a second copy of an item that still has its item_instance row.
+    //
+    // character_inventory is the case this was written for. The other three come from handlers
+    // that resolve items by GUID -- Player::GetItemByGuid scans bank slots and bank bags
+    // (PlayerStorage.cpp:423,435), so CMSG_SEND_MAIL and CMSG_AUCTION_SELL_ITEM can take an
+    // item straight out of a live vault. The stock client cannot do it, since its mail and
+    // auction frames only accept items dragged from the bags, but a forged packet can. The
+    // drain that follows within a tick removes the vault row correctly; this covers a crash
+    // inside that tick.
+    //
+    // Every joined column is indexed (mail_items and auctionhouse on the item, guild_bank_item
+    // by Idx_item_guid), so this stays an index lookup per vault row.
     CharacterDatabase.DirectExecute(
         "DELETE v FROM mod_extended_bank_vault_items v "
-        "JOIN character_inventory ci ON ci.item = v.item "
-        "WHERE v.owner_guid = {}", lowGuid);
+        "LEFT JOIN character_inventory ci ON ci.item = v.item "
+        "LEFT JOIN mail_items mi ON mi.item_guid = v.item "
+        "LEFT JOIN auctionhouse ah ON ah.itemguid = v.item "
+        "LEFT JOIN guild_bank_item gbi ON gbi.item_guid = v.item "
+        "WHERE v.owner_guid = {} AND (ci.item IS NOT NULL OR mi.item_guid IS NOT NULL "
+        "OR ah.itemguid IS NOT NULL OR gbi.item_guid IS NOT NULL)", lowGuid);
 }
 
 void ExtendedBankMgr::DeleteCharacterData(CharacterDatabaseTransaction trans, ObjectGuid::LowType lowGuid)

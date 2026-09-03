@@ -17,21 +17,33 @@ Pair it with a log grep, because the flush writes only the rows a layout delta s
 commits them asynchronously. A statement that fails — a unique-key collision from a wrong delta,
 say — aborts the transaction with **nothing shown in game**: the vault silently reverts to its
 previous layout rather than losing anything, which is easy to mistake for the player misdragging.
-The abort is a database error, and errors do reach the file even at the shipped appender level:
+The abort is a database error, and `Logger.sql.sql` routes those to the **Errors** appender with
+the offending statement text -- not to `Server.log`, where an earlier revision of this file sent
+you looking:
 
 ```bash
-grep -i mod_extended_bank_vault_items Server.log
+grep -i mod_extended_bank_vault_items build/bin/RelWithDebInfo/logs/Errors.log
 ```
+
+Both log files open in `w` mode, so they are truncated at every server start and anything in
+them belongs to the current run.
 
 ## 0. Instrumentation first
 
 - [x] Set `Logger.module=3` in `worldserver.conf`. At the shipped `4` (WARN and above) the
       module's `LOG_INFO` lines are suppressed and its recovery paths are silent.
-- [ ] **Also lower the appender.** `Appender.Server=2,5,...` filters the *file* at level 5
-      (ERROR), so even with `Logger.module=3` the module's INFO and WARN lines reach only the
-      console window and never `Server.log`. Until that is changed, "no module lines in
-      Server.log" proves only that no module *errors* occurred — a far weaker statement, and an
-      easy one to over-read. This caught us out for most of the 2026-09-02 session.
+- [x] **Also lower the appender.** Done: this realm now runs `Appender.Server=2,3,0,Server.log,w`
+      (level 3 = INFO). Before that it was level 5, which filtered the *file* at ERROR, so even
+      with `Logger.module=3` the module's INFO and WARN lines reached only the console window.
+      For most of the 2026-09-02 session that made "no module lines in `Server.log`" mean only
+      "no module *errors*" — a far weaker statement than it looked, and it caught us out. With
+      the appender at INFO the absence of module lines now genuinely means no recovery or repair
+      path ran.
+- [x] **Know which file SQL failures go to.** `Logger.sql.sql=2,Console Errors` with
+      `Appender.Errors=2,2,0,Errors.log,w`, so a failed statement is written to `Errors.log`
+      with its text — *not* to `Server.log`. Both files are opened `w` and truncated at startup,
+      so anything in them belongs to the current run. Verified 2026-09-03: `Errors.log` held
+      nothing but startup data warnings across a full day of vault testing.
 - [x] Baseline the realm's pre-existing orphans (check 11 with its last line removed) so a later
       hit can be attributed to this module rather than to years of accumulated data.
 - [x] Snapshot the test character's bank rows. Several tests below diff against it:
@@ -111,6 +123,17 @@ The section that matters most.
 - [x] Switch to vault 1: its count is unchanged and all its bags are present. *A wrong count here
       makes the core mail vault 1's bank bags back — grep the log for `sent by mail`.*
 - [x] Relog: both counts restored.
+- [x] Per-vault purchasing on the **stock Blizzard bank frame**. Verified 2026-09-03: the
+      purchase button appears and disappears as the open vault's count crosses seven, in both
+      directions, across vault switches and relogs. `UpdateBagSlotStatus`
+      (`FrameXML/BankFrame.lua:103`) takes both the locked-slot tint and the purchase frame's
+      visibility from one `GetNumBankSlots()` call, whose `full` return is computed live as
+      `count > 6`, so there is nothing for the module to invalidate.
+- [ ] **ElvUI users only.** ElvUI stops offering the purchase button once vault 1 owns all
+      seven slots and does not offer it again in a vault with fewer. Not reproducible on the
+      default UI, out of this module's control. `/run PurchaseSlot()` is a full workaround: it
+      gates on nothing but the live count being under seven, so it follows the open vault, and
+      it fires immediately with no confirmation dialog. Retest if ElvUI is ever in scope.
 - [ ] Buy several slots in a row and watch the frame after each. A stale count was observed
       here more than once (display one purchase behind, correcting on reopen) but a controlled
       A/B could not reproduce it, and the server count was correct every time. Investigated
@@ -193,6 +216,14 @@ Hard-kill means Task Manager → End Task, **not** `.server shutdown`.
       module joins those two tables. Verified 2026-09-03: unchanged across a login by a
       character owning no vault, +1 across a login by one that does, and +1 again after a
       hard kill and restart, with the vault intact.
+- [ ] The repair covers mail, auction and guild bank as well as `character_inventory`. Reaching
+      the state needs a forged packet — `Player::GetItemByGuid` scans bank slots
+      (`PlayerStorage.cpp:423,435`), so `CMSG_SEND_MAIL` and `CMSG_AUCTION_SELL_ITEM` can take an
+      item out of an open vault, though the stock client's frames accept only items dragged from
+      the bags — plus a crash inside the one tick before the next drain. Not reachable by
+      playing; the cheap substitute is a hand-written vault row for an item already sitting in
+      mail, then a login, then confirming the row is gone. **That is a DB write on a real
+      character, so it is nobody's call but yours.**
 
       This counter is cumulative since the **MySQL** server started, not since the test, and a
       worldserver restart does not reset it — only the deltas mean anything. Select
@@ -215,13 +246,27 @@ Hard-kill means Task Manager → End Task, **not** `.server shutdown`.
 Each of these reaches `_SaveInventory` **without** firing `OnPlayerSave` — which is exactly what
 the drain exists for. With a vault open, do the action, then check invariant 1.
 
+**Read this before spending time here.** A static sweep on 2026-09-03 established that these are
+covered by construction, not by luck. `opHandle->Call` exists in exactly four places in the
+server (`WorldSession.cpp:470,491,504,523`, the four dispatching arms of one switch), and every
+one is immediately preceded by `CanPacketReceive`; `WorldSocket::ProcessIncoming` only queues.
+None of the functions involved is reachable off a packet either — `Player::RefundItem` has a
+single caller at `ItemHandler.cpp:1453`, and `Guild::PlayerMoveItemData` serves only
+`CMSG_GUILD_BANK_SWAP_ITEMS`. So the value left in the entries below is confirming the *handler*
+behaves, not confirming the drain fires. Do them when convenient; none is load-bearing.
+
+Two genuine exceptions were found by that sweep and are listed separately: the trade partner
+(now fixed, below) and the mail/auction reach-in (covered by `SelfHealVaultRows`, §8).
+
 - [x] Take a mail attachment.
 - [ ] Post an auction; cancel an auction.
 - [ ] Deposit into and withdraw from the guild bank.
 - [ ] Refund a recently bought item.
-- [ ] Buy an item back from a vendor.
+- [ ] Wrap an item as a gift. *`ItemHandler.cpp:1205`, the site the README used to mislabel as
+      mail.*
+- [ ] Open a lockbox or container item. *`SpellHandler.cpp:318`.*
 - [ ] Open a trade window with a vault open — switching must be refused.
-- [ ] **Trade completed while the *other* player has a vault open.** Two characters at a bank.
+- [x] **Trade completed while the *other* player has a vault open.** Two characters at a bank.
       B opens vault 2 and drags an item inside it; A accepts the trade within the same second.
       B's `character_inventory` bank rows must be unchanged and B's vault 2 layout intact.
       *`HandleAcceptTradeOpcode` calls `SaveInventoryAndGoldToDB` on **both** players
@@ -229,8 +274,24 @@ the drain exists for. With a vault open, do the action, then check invariant 1.
       during A's accept. The hook now drains the partner on `CMSG_ACCEPT_TRADE` as well. Before
       that, the window was one world tick — B's `OnPlayerUpdate` drain closes it otherwise — so
       a negative result here proves little unless the timing is tight. Run it repeatedly.*
+
+      Run 2026-09-03 with `Test` (24008) and `Testthree` (24010), both at the Orgrimmar banker,
+      Testthree holding vault 2 open and Test completing the trade. A two-way trade completed;
+      both items changed hands and every other row was byte-identical — both vault layouts, bag
+      slot counts and money — with all 11 invariants clean. What that establishes is the safe
+      part: reaching across to a second `Player` from inside a packet hook does not crash,
+      deadlock on the recursive mutex, or disturb the partner's vault. It does **not** establish
+      that the race was caught, which by the entry below is not reachable by hand at all.
 - [ ] The same with the roles reversed, so the completing accept comes from the player who has
       the vault open rather than from their partner.
+- [x] **The UI makes the race unreachable by hand.** Established 2026-09-03. The bank frame and
+      the trade frame are both UI panels and cannot be shown together, and `TradeFrame_OnHide`
+      calls `CloseTrade()` (`FrameXML/TradeFrame.lua:156`), which sends `CMSG_CANCEL_TRADE` — so
+      talking to the banker cancels an in-progress trade, as it does at any NPC. Hiding the bank
+      frame sends nothing, so a vault does stay live while its owner trades; they simply cannot
+      reach it to dirty anything. Only one ordering is even testable: open the vault, *then*
+      trade, then complete without touching the banker again. Treat the entries above as a
+      safety check on reaching across to another `Player` from a packet hook, not as a bug hunt.
 - [ ] Enter combat with a vault open — switching must be refused.
 - [ ] Loot a brand-new item straight into a vault's bank slot, then switch away immediately.
       *`ITEM_NEW` items have no `item_instance` row yet; this is the item-loss case.*

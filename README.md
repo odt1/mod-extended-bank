@@ -187,9 +187,48 @@ most realms, and one tick is all it takes. Reaching across to another player fro
 is safe here specifically because `CMSG_ACCEPT_TRADE` is `PROCESS_THREADUNSAFE`: it runs only in
 `World::UpdateSessions`, which does not overlap the `MapUpdater` pool.
 
+How reachable that partner case is turned out to be a separate question, answered on
+2026-09-03 by trying it. The bank frame and the trade frame are both UI panels and cannot be
+open at once, and `TradeFrame_OnHide` calls `CloseTrade()`
+(`FrameXML/TradeFrame.lua:156`), which sends `CMSG_CANCEL_TRADE` — so anything that hides the
+trade frame cancels the trade outright. Talking to the banker does exactly that, which is stock
+behaviour for every NPC and not something this module introduces.
+
+Hiding the *bank* frame, by contrast, sends nothing at all, because no close opcode exists. So
+a vault stays live while its owner trades — but its owner cannot see or touch it, and a bank
+item can therefore not be dirtied by any ordinary action during a trade. The drain fires and
+finds nothing queued. Reaching the original fault needs a scripted client, or one of the
+exotic routes that dirties a bank item without the player touching it, such as an enchantment
+or item duration ticking down. The guard stays because it costs one comparison, not because
+the hole is easy to fall into.
+
 `TC9GrpcHandler` cannot be covered at all — it saves an arbitrary player by GUID over gRPC with
 no packet to precede. It is gated behind `Cluster.Enabled`, which defaults to `false`, so it is
 inert unless the realm runs in cluster mode.
+
+Everything else in that table is reached only through a packet handler, and no packet handler
+can run without the drain. `opHandle->Call` appears in exactly four places in the whole server —
+`WorldSession.cpp:470,491,504,523`, the `STATUS_LOGGEDIN`, `STATUS_LOGGEDIN_OR_RECENTLY_LOGGOUT`,
+`STATUS_TRANSFER` and `STATUS_AUTHED` arms of one switch — and each is immediately preceded by
+`CanPacketReceive`. `WorldSocket::ProcessIncoming` only queues. Nor is any of those functions
+reachable off a packet: `Player::RefundItem` has one caller (`ItemHandler.cpp:1453`), and
+`Guild::PlayerMoveItemData` exists only to serve `CMSG_GUILD_BANK_SWAP_ITEMS`.
+
+#### Handlers that can reach *into* a live vault
+
+A separate matter from saving, and worth stating because it is not obvious.
+`Player::GetItemByGuid` scans bank slots and bank bags (`PlayerStorage.cpp:423,435`), and mail
+(`MailHandler.cpp:210,240`) and auction (`AuctionHouseHandler.cpp:205`) resolve their items with
+it. So `CMSG_SEND_MAIL` and `CMSG_AUCTION_SELL_ITEM` can take an item straight out of an open
+vault. The stock client cannot do it — its mail and auction frames accept only items dragged
+from the bags — but a forged packet can, exactly as `CMSG_SET_TRADE_ITEM` can.
+
+The outcome is correct either way: the item leaves the bank, and the next drain sees it missing,
+drops its vault row and writes the core's inventory in one transaction. The residue is the tick
+between the handler's commit and that drain, during which the item is in `mail_items` or
+`auctionhouse` *and* still listed in a vault. A crash there would leave a stale vault row whose
+`item_instance` row still exists, and opening that vault afterwards would load a second copy.
+`SelfHealVaultRows` therefore checks all four tables at login, not just `character_inventory`.
 
 The drain is a lock-free atomic check unless the player actually has a vault open, and beyond
 that it compares the live bank against the layout last written and returns without touching the
@@ -454,6 +493,18 @@ rows need clearing.
   known and it may not be specific to this module; the frame is now closed explicitly before
   the bank opens, which is the most likely remedy. Worth knowing about because it looks alarming
   and invites a bug report about lost gold, when nothing has been lost.
+
+  Later evidence points at an addon rather than at this module. The stock Blizzard bank frame
+  was confirmed on 2026-09-03 to handle per-vault slot counts correctly in every direction:
+  the purchase button appears and disappears as the open vault's count crosses seven, across
+  vault switches and relogs alike. The client is well behaved here by construction —
+  `UpdateBagSlotStatus` (`FrameXML/BankFrame.lua:103`) derives both the locked-slot tint and
+  the purchase frame's visibility from the same `GetNumBankSlots()` call, whose second return
+  is computed live as `count > 6` and is not cached anywhere. **ElvUI, by contrast, stops
+  offering the purchase button once vault 1 has bought all seven slots, and does not offer it
+  again in a vault that has fewer.** That is the only UI seen to get this wrong, it is out of
+  this module's control, and `/run PurchaseSlot()` is a complete workaround — that function
+  gates on nothing but the live count being below seven, so it always follows the open vault.
 - **A rejected item is announced twice, because a chat line alone is not enough.** When a
   capped item is refused, it leaves the cursor and vanishes from the bank in the same instant,
   which reads as item loss to the player. The module therefore writes the detail to chat *and*
