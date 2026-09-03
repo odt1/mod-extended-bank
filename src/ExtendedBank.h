@@ -94,17 +94,12 @@ struct ExtendedBankVault
 };
 
 // One entry of the layout that was last written to `mod_extended_bank_vault_items`.
-// Kept so a flush that would change nothing can be skipped.
+// Kept so a flush can write only the rows that differ, and skip entirely when none do.
 struct ExtendedBankPersistedPos
 {
     ObjectGuid::LowType Item{ 0 };
     ObjectGuid::LowType Bag{ 0 };
     uint8 Slot{ 0 };
-
-    bool operator==(ExtendedBankPersistedPos const& other) const
-    {
-        return Item == other.Item && Bag == other.Bag && Slot == other.Slot;
-    }
 };
 
 // Live session state, present only while a player has a vault other than the
@@ -129,6 +124,30 @@ struct ExtendedBankItemPos
     Item* ItemPtr{ nullptr };
     ObjectGuid::LowType Bag{ 0 };
     uint8 Slot{ 0 };
+};
+
+// What a flush has to write: the difference between the layout last persisted for the live
+// vault and the layout the bank holds now. Computed once per flush in a single pass, so a
+// drag inside a full vault costs two statements instead of one per item.
+struct ExtendedBankLayoutDelta
+{
+    // Indices into the live item vector whose row has to be written -- the item is new to
+    // this vault, or it moved.
+    std::vector<std::size_t> Written;
+
+    // A subset of Written: items that were not in this vault at the last flush, and so may
+    // still carry a `character_inventory` row from wherever they came from.
+    std::vector<std::size_t> Entered;
+
+    // Item GUIDs the vault used to hold and no longer does.
+    std::vector<ObjectGuid::LowType> Removed;
+
+    bool BagSlotsChanged{ false };
+
+    [[nodiscard]] bool Any() const
+    {
+        return !Written.empty() || !Removed.empty() || BagSlotsChanged;
+    }
 };
 
 // Everything the debug command needs that is not otherwise observable from outside.
@@ -208,7 +227,11 @@ private:
     void LoadVaultList(ObjectGuid playerGuid);
     void CaptureLayout(ExtendedBankSession& session, std::vector<ExtendedBankItemPos> const& items,
         uint8 bagSlots) const;
-    [[nodiscard]] bool LayoutMatches(ExtendedBankSession const& session,
+
+    // One O(n + m) pass replacing what used to be a separate order-sensitive comparison and a
+    // nested "did anything leave" scan. A full vault is 28 slots plus seven 36-slot bags, so
+    // the nested form ran into five figures of comparisons on every packet the player sent.
+    [[nodiscard]] ExtendedBankLayoutDelta ComputeLayoutDelta(ExtendedBankSession const& session,
         std::vector<ExtendedBankItemPos> const& items, uint8 bagSlots) const;
     [[nodiscard]] bool AnyItemQueued(std::vector<ExtendedBankItemPos> const& items) const;
 
@@ -218,14 +241,9 @@ private:
     bool EvictRestrictedItems(Player* player, std::vector<ExtendedBankItemPos> const& items,
         CharacterDatabaseTransaction trans, ObjectGuid bankerGuid);
 
-    // True when something the vault used to hold is no longer in the live bank -- i.e. the
-    // player moved it out. That is the only case that can strand an item between the two
-    // tables, and so the only case worth paying for the core's inventory save.
-    [[nodiscard]] bool AnyPersistedItemGone(ExtendedBankSession const& session,
-        std::vector<ExtendedBankItemPos> const& items) const;
     void SyncSessionCount() { _activeSessionCount.store(_sessions.size()); }
     void PersistVaultLayout(Player* player, uint8 vault, std::vector<ExtendedBankItemPos> const& items,
-        CharacterDatabaseTransaction trans, bool rewritePositions);
+        ExtendedBankLayoutDelta const& delta, CharacterDatabaseTransaction trans);
 
     // saveCoreInventory pulls Player::SaveInventoryAndGoldToDB into the same transaction. Only
     // pass true where the Item objects are about to be freed -- it drags in the whole of

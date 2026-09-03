@@ -1,11 +1,17 @@
 # mod-extended-bank
 
-Blanced, vanilla-like bank space extension module that adds new bank pages or **vaults**. No client addon, no custom frame, no client patch: pick a vault page from the banker's new gossip/dialogue window and the ordinary bank frame opens showing that vault's contents.
+Blanced, vanilla-like bank space extension module that adds new bank pages or **vaults**. No client addon, no custom frame, no client patch: pick a vault page from the banker's new gossip/dialogue window and the ordinary bank UI opens showing that vault's contents.
 
-- Vaults 2 to 8 (by default) are new _extra_ banks, each with its own usual 28 item slots and its own 7 purchasable bank bag slots using the original vanilla system and UI.
+- Vaults 2 to 8 (by default) are the new _extra_ banks, each with its own usual 28 item slots and its own 7 purchasable bank bag slots using the original vanilla system and UI.
 - Vault 1 is the character's normal bank and its storage is never modified by this module.
-- New vaults/pages are purchased with the same dialogue menu, and are at extremely steep prices for the gold sink mechanic and balance reasons. 
+- New vaults/pages are purchased with the same dialogue menu, and by default are at extremely steep prices for the gold sink mechanic and balance reasons. 
 - Vaults can be renamed, colour codes and inline icons supported.
+
+## Disclamer:
+
+Vibe-coded using Claude Opus 5 against [AzerothCore mod-playerbots branch](https://github.com/mod-playerbots/azerothcore-wotlk/tree/Playerbot), but rigorously tested on solo server as much as possible (see tools\TESTING.md). 
+
+Please feel free to report any issues, PRs and provide any reports and additional testing, thanks and enjoy! 
 
 ## How it works
 
@@ -136,7 +142,17 @@ drains at three points, which between them precede every one of those:
 
 The drain is a lock-free atomic check unless the player actually has a vault open, and beyond
 that it compares the live bank against the layout last written and returns without touching the
-database when nothing has moved. It rewrites position rows only when something actually moved.
+database when nothing has moved.
+
+That comparison is a single hash-map pass producing a delta — which rows entered the vault,
+which moved, which left — and the flush writes exactly those. Dragging one item inside a full
+vault costs one `DELETE` and one multi-row `INSERT`, not a rewrite of all 287 possible rows.
+The two are ordered deliberately: every row that is about to move is deleted before any is
+written back, because two items swapping places would otherwise collide on
+`UNIQUE KEY (owner_guid, vault, bag, slot)` — the first `INSERT` landing on a slot its previous
+occupant has not vacated yet — and abort the whole transaction. A row left untouched cannot
+collide with one that moved, because a position only becomes free when whatever held it is
+itself in that delete.
 
 What the drain deliberately does **not** do is call `Player::SaveInventoryAndGoldToDB`. Taking
 the vault's items out of the queue is the entire requirement — `_SaveInventory` returns early on

@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace
@@ -83,14 +85,20 @@ void ExtendedBankMgr::LoadPlayer(Player* player)
     _sessions.erase(playerGuid);
     SyncSessionCount();
 
+    LoadVaultList(playerGuid);
+
     // Login is the only moment at which no write of this module's can still be in flight, so
     // it is the only moment at which reading character_inventory to repair vault rows is
     // safe. Reads take a synchronous connection while writes are committed on the async
     // worker pool, so running this check mid-session could see a row whose deletion has been
     // queued but not executed, and delete a perfectly good vault row because of it.
-    SelfHealVaultRows(playerGuid.GetCounter());
-
-    LoadVaultList(playerGuid);
+    //
+    // Gated on the list loaded just above: only a character who owns a vault beyond the
+    // default one can have rows in the item table at all, so on a realm where most characters
+    // never buy a vault this synchronous query disappears from the login path entirely
+    // instead of running once per login for everyone.
+    if (GetHighestOwnedVault(playerGuid) != EXTENDED_BANK_DEFAULT_VAULT)
+        SelfHealVaultRows(playerGuid.GetCounter());
 
     // The live bank always holds the default vault here: character_inventory has not been
     // read yet and it is the only thing Player::_LoadInventory will restore. PLAYER_BYTES_2,
@@ -268,34 +276,83 @@ void ExtendedBankMgr::CollectLiveBankItems(Player* player, std::vector<ExtendedB
 }
 
 void ExtendedBankMgr::PersistVaultLayout(Player* player, uint8 vault,
-    std::vector<ExtendedBankItemPos> const& items, CharacterDatabaseTransaction trans,
-    bool rewritePositions)
+    std::vector<ExtendedBankItemPos> const& items, ExtendedBankLayoutDelta const& delta,
+    CharacterDatabaseTransaction trans)
 {
     ObjectGuid::LowType const lowGuid = player->GetGUID().GetCounter();
 
-    if (vault != EXTENDED_BANK_DEFAULT_VAULT && rewritePositions)
+    if (vault != EXTENDED_BANK_DEFAULT_VAULT)
     {
-        trans->Append("DELETE FROM mod_extended_bank_vault_items WHERE owner_guid = {} AND vault = {}",
-            lowGuid, vault);
+        // Only the rows that actually changed are touched. This used to delete the whole vault
+        // and re-insert every item on any change at all, which is two statements per item --
+        // over 500 of them for a single drag inside a full vault, every one of which had to be
+        // parsed and executed on the async worker for a layout that differed in one row.
+        //
+        // Every row about to move is deleted before any of them is written back. Two items
+        // swapping places inside a vault would otherwise collide on
+        // UNIQUE KEY (owner_guid, vault, bag, slot): the first INSERT would land on a slot its
+        // previous occupant has not vacated yet, and abort the whole transaction. A row left
+        // untouched cannot collide with one that moved, because a position only becomes
+        // available when whatever held it is itself in this delete list.
+        std::string doomed;
 
-        for (ExtendedBankItemPos const& pos : items)
+        auto const addDoomed = [&doomed](ObjectGuid::LowType itemGuid)
         {
-            // PRIMARY KEY is (item) alone, while the DELETE above is scoped to this vault, so
-            // a row left behind for the same item under a different vault by an unclean
-            // shutdown would abort the whole transaction and lose the entire layout.
-            trans->Append("INSERT INTO mod_extended_bank_vault_items (item, owner_guid, vault, bag, slot) "
-                "VALUES ({}, {}, {}, {}, {}) "
-                "ON DUPLICATE KEY UPDATE owner_guid = VALUES(owner_guid), vault = VALUES(vault), "
-                "bag = VALUES(bag), slot = VALUES(slot)",
-                pos.ItemPtr->GetGUID().GetCounter(), lowGuid, vault, pos.Bag, pos.Slot);
+            if (!doomed.empty())
+                doomed += ',';
 
-            // The module now owns this item's position, so any character_inventory row still
-            // describing where it used to sit has to go. This is delete-by-item-GUID, the
-            // very call mail, auction and the guild bank make when an item leaves a player's
-            // inventory; it can never touch the default vault's rows, because the default
-            // vault's items are not live while another vault is open.
-            pos.ItemPtr->DeleteFromInventoryDB(trans);
+            doomed += std::to_string(itemGuid);
+        };
+
+        for (std::size_t index : delta.Written)
+            addDoomed(items[index].ItemPtr->GetGUID().GetCounter());
+
+        for (ObjectGuid::LowType itemGuid : delta.Removed)
+            addDoomed(itemGuid);
+
+        if (!doomed.empty())
+        {
+            // Keyed on the item alone, deliberately: PRIMARY KEY is (item), item GUIDs are
+            // globally unique, and this statement is the module claiming them. A row left for
+            // one of these items under a different vault -- or under a different owner, which
+            // a crash during a character delete plus GUID reuse can produce -- would survive
+            // any narrower delete and then abort the INSERT on the primary key.
+            //
+            // The predecessor of this code used ON DUPLICATE KEY UPDATE for that instead. It
+            // is not used here because this table has a second unique key on
+            // (owner_guid, vault, bag, slot): an upsert that collided on *that* one would
+            // quietly repoint an existing row at a different item, which loses an item, where
+            // aborting the transaction only loses the flush and is repaired at next login.
+            trans->Append("DELETE FROM mod_extended_bank_vault_items WHERE item IN ({})", doomed);
         }
+
+        if (!delta.Written.empty())
+        {
+            std::string values;
+
+            for (std::size_t index : delta.Written)
+            {
+                if (!values.empty())
+                    values += ',';
+
+                values += Acore::StringFormat("({},{},{},{},{})",
+                    items[index].ItemPtr->GetGUID().GetCounter(), lowGuid, vault,
+                    items[index].Bag, uint32(items[index].Slot));
+            }
+
+            trans->Append("INSERT INTO mod_extended_bank_vault_items (item, owner_guid, vault, bag, slot) "
+                "VALUES {}", values);
+        }
+
+        // The module now owns these items' positions, so any character_inventory row still
+        // describing where they used to sit has to go. This is delete-by-item-GUID, the very
+        // call mail, auction and the guild bank make when an item leaves a player's
+        // inventory; it can never touch the default vault's rows, because the default vault's
+        // items are not live while another vault is open. Only items that were not already in
+        // this vault at the last flush need it -- the ones that were had their row deleted
+        // then, and have had no inventory position since.
+        for (std::size_t index : delta.Entered)
+            items[index].ItemPtr->DeleteFromInventoryDB(trans);
     }
 
     // item_instance has to be written for every vault, the default one included: the Item
@@ -332,44 +389,44 @@ void ExtendedBankMgr::CaptureLayout(ExtendedBankSession& session,
     session.PersistedBagSlots = bagSlots;
 }
 
-bool ExtendedBankMgr::LayoutMatches(ExtendedBankSession const& session,
+ExtendedBankLayoutDelta ExtendedBankMgr::ComputeLayoutDelta(ExtendedBankSession const& session,
     std::vector<ExtendedBankItemPos> const& items, uint8 bagSlots) const
 {
-    if (session.PersistedBagSlots != bagSlots || session.PersistedLayout.size() != items.size())
-        return false;
+    ExtendedBankLayoutDelta delta;
+    delta.BagSlotsChanged = session.PersistedBagSlots != bagSlots;
+
+    // Indexed by item GUID rather than by position, so an item that merely moved is told apart
+    // from one that entered or left. What is left in the map once every live item has been
+    // looked up is, by definition, what the vault no longer holds.
+    std::unordered_map<ObjectGuid::LowType, ExtendedBankPersistedPos const*> was;
+    was.reserve(session.PersistedLayout.size());
+
+    for (ExtendedBankPersistedPos const& pos : session.PersistedLayout)
+        was.emplace(pos.Item, &pos);
 
     for (std::size_t i = 0; i < items.size(); ++i)
     {
-        ExtendedBankPersistedPos const live{ items[i].ItemPtr->GetGUID().GetCounter(),
-            items[i].Bag, items[i].Slot };
+        auto const itr = was.find(items[i].ItemPtr->GetGUID().GetCounter());
 
-        if (!(session.PersistedLayout[i] == live))
-            return false;
-    }
-
-    return true;
-}
-
-bool ExtendedBankMgr::AnyPersistedItemGone(ExtendedBankSession const& session,
-    std::vector<ExtendedBankItemPos> const& items) const
-{
-    for (ExtendedBankPersistedPos const& was : session.PersistedLayout)
-    {
-        bool stillHere = false;
-        for (ExtendedBankItemPos const& now : items)
+        if (itr == was.end())
         {
-            if (now.ItemPtr->GetGUID().GetCounter() == was.Item)
-            {
-                stillHere = true;
-                break;
-            }
+            delta.Written.push_back(i);
+            delta.Entered.push_back(i);
+            continue;
         }
 
-        if (!stillHere)
-            return true;
+        if (itr->second->Bag != items[i].Bag || itr->second->Slot != items[i].Slot)
+            delta.Written.push_back(i);
+
+        was.erase(itr);
     }
 
-    return false;
+    delta.Removed.reserve(was.size());
+
+    for (auto const& entry : was)
+        delta.Removed.push_back(entry.first);
+
+    return delta;
 }
 
 bool ExtendedBankMgr::AnyItemQueued(std::vector<ExtendedBankItemPos> const& items) const
@@ -1055,11 +1112,11 @@ void ExtendedBankMgr::FlushLiveVault(Player* player, ExtendedBankSession& sessio
     }
 
     uint8 const bagSlots = player->GetBankBagSlotCount();
-    bool const layoutChanged = evicted || !LayoutMatches(session, live, bagSlots);
+    ExtendedBankLayoutDelta const delta = ComputeLayoutDelta(session, live, bagSlots);
 
     // Nothing moved and nothing is dirty: the vault's items are already out of the queue, so
     // there is nothing for _SaveInventory to get wrong and nothing to write.
-    if (!layoutChanged && !AnyItemQueued(live) && !saveCoreInventory)
+    if (!delta.Any() && !evicted && !AnyItemQueued(live) && !saveCoreInventory)
         return;
 
     // An item that has left the vault since the last flush is about to lose its vault row,
@@ -1067,12 +1124,12 @@ void ExtendedBankMgr::FlushLiveVault(Player* player, ExtendedBankSession& sessio
     // Without both in one transaction it belongs to neither table until the next periodic
     // save, and a crash in that window strands it. This is rare -- it needs an actual move
     // out of the bank -- so the cost of pulling in _SaveInventory is paid only then.
-    bool const itemLeftVault = AnyPersistedItemGone(session, live);
+    bool const itemLeftVault = !delta.Removed.empty();
 
-    // Position rows are only rewritten when something actually moved. Otherwise this just
-    // un-queues the vault's items and writes their item_instance changes -- which is the whole
-    // of what keeps the core from putting a vault item into character_inventory.
-    PersistVaultLayout(player, session.ActiveVault, live, trans, layoutChanged);
+    // Writes only the rows the delta says changed. When it says none did, this just un-queues
+    // the vault's items and writes their item_instance changes -- which is the whole of what
+    // keeps the core from putting a vault item into character_inventory.
+    PersistVaultLayout(player, session.ActiveVault, live, delta, trans);
 
     if (saveCoreInventory || itemLeftVault || evicted)
     {

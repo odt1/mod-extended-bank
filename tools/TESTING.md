@@ -1,7 +1,7 @@
 # mod-extended-bank — test plan
 
-**Verified 2026-09-02** against a live realm (`Admin`, guid 3002) driven over SOAP plus direct
-read-only SQL. `[x]` means observed passing, not reasoned about. Unticked entries are genuinely
+**Verified 2026-09-02**, with the delta flush re-verified **2026-09-03**, against a live realm
+(`Admin`, guid 3002) driven over SOAP plus direct read-only SQL. `[x]` means observed passing, not reasoned about. Unticked entries are genuinely
 untested — several are marked with why.
 
 Every entry says what it *proves*, not just what to click. The happy path is marked as such; the
@@ -11,6 +11,16 @@ Run `tools/check_invariants.sql` after anything that moves an item. Zero rows is
 
 ```bash
 mysql -h127.0.0.1 -uacore -pacore acore_characters < tools/check_invariants.sql
+```
+
+Pair it with a log grep, because the flush writes only the rows a layout delta says changed and
+commits them asynchronously. A statement that fails — a unique-key collision from a wrong delta,
+say — aborts the transaction with **nothing shown in game**: the vault silently reverts to its
+previous layout rather than losing anything, which is easy to mistake for the player misdragging.
+The abort is a database error, and errors do reach the file even at the shipped appender level:
+
+```bash
+grep -i mod_extended_bank_vault_items Server.log
 ```
 
 ## 0. Instrumentation first
@@ -71,6 +81,14 @@ The section that matters most.
       vault row.
 - [x] Drag an item **into** vault 2, `.save`, relog. It stays in the vault and does not snap back
       to the bag. *Proves `DeleteFromInventoryDB` runs for items taken in.*
+- [x] **Swap two items inside a vault** by dropping one onto the other, several times in a row.
+      Both keep their new positions across a switch away and back. *The flush writes only the
+      rows that changed, so a swap is the case that would collide on
+      `UNIQUE KEY (owner_guid, vault, bag, slot)` if the deletes were not all emitted ahead of
+      the inserts. A failure here aborts the transaction: positions silently revert to the
+      previous flush rather than being lost.*
+- [x] The same swap between a top-level bank slot and a slot inside a bank bag, and between two
+      different bank bags.
 - [ ] Rearrange inside vault 1, switch to vault 2, switch back. The rearrangement stuck. *Proves
       the default-vault branch of `PersistOutgoingVault`.*
 - [x] Rearrange inside vault 2, walk away to force a revert, return. Layout preserved.
@@ -80,6 +98,11 @@ The section that matters most.
 - [ ] Same with two bags of different sizes.
 - [ ] Fill vault 2 completely — 28 slots plus 7 bags — then switch away and back. *Worst case
       for switch cost and for `CanBankItem` refusals.*
+- [x] A near-full vault — 28 slots plus a couple of bags with contents — then a single drag
+      inside it. Position stuck across a switch away and back; no `mod_extended_bank_vault_items`
+      line in `Server.log` and no invariant rows. *This is where the flush writes two statements
+      where it used to write over five hundred, so it is where a bad delta has the most room to
+      show. Verified 2026-09-03 against the delta flush.*
 
 ## 4. Bank bag slots
 
@@ -155,6 +178,27 @@ Hard-kill means Task Manager → End Task, **not** `.server shutdown`.
       Two traps: the wrong count must be forced to disk *before* the kill or the DB still holds
       the right value and the test proves nothing; and the `Restoring bank bag slot count` line
       goes to the console only, not `Server.log`, unless the appender level is lowered too.
+- [x] `SelfHealVaultRows` runs for a character who owns a vault and is skipped for one who does
+      not. It writes nothing and logs nothing when there is nothing to repair, so count the
+      statement itself instead:
+
+      ```sql
+      SELECT SCHEMA_NAME, COUNT_STAR, DIGEST_TEXT
+      FROM performance_schema.events_statements_summary_by_digest
+      WHERE DIGEST_TEXT LIKE '%mod_extended_bank_vault_items%'
+        AND DIGEST_TEXT LIKE '%character_inventory%';
+      ```
+
+      The `DELETE v ... JOIN character_inventory` digest is the repair; nothing else in the
+      module joins those two tables. Verified 2026-09-03: unchanged across a login by a
+      character owning no vault, +1 across a login by one that does, and +1 again after a
+      hard kill and restart, with the vault intact.
+
+      This counter is cumulative since the **MySQL** server started, not since the test, and a
+      worldserver restart does not reset it — only the deltas mean anything. Select
+      `SCHEMA_NAME` as well: the table is keyed on schema plus digest, so the same query run
+      from a connection with no default database appears as a second row rather than
+      incrementing the first.
 
 ## 9. Concurrency
 
@@ -192,7 +236,7 @@ the drain exists for. With a vault open, do the action, then check invariant 1.
       is the only known route -- a drag to an *empty* slot always leaves the source slot free,
       so the item just bounces back. Verified: item in mail exactly once, no character_inventory
       row, no vault row, displaced items intact in the bags, all invariants pass.
-- [ ] The rejection announcement itself. Besides the chat line, the banker sends a boss whisper
+- [x] The rejection announcement itself. Besides the chat line, the banker sends a boss whisper
       naming the item. Observed on a stock client it draws no chat bubble over the NPC -- it
       renders as a full-screen system-style notice and triggers an addon alert sound, which is
       what is wanted. `ChatHandler::SendNotification` was tried next to it and removed as a
