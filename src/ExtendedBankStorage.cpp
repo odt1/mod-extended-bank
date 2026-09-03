@@ -8,10 +8,12 @@
 #include "ExtendedBank.h"
 #include "Bag.h"
 #include "Chat.h"
+#include "Creature.h"
 #include "DatabaseEnv.h"
 #include "Item.h"
 #include "Log.h"
 #include "Mail.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "StringConvert.h"
@@ -902,7 +904,7 @@ namespace
 }
 
 bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedBankItemPos> const& items,
-    CharacterDatabaseTransaction trans)
+    CharacterDatabaseTransaction trans, ObjectGuid bankerGuid)
 {
     // A restricted *bag* drags its contents with it: they leave the bank inside it, so they
     // must leave the vault's rows too. Without this they keep their vault rows while no longer
@@ -931,6 +933,8 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
 
     ChatHandler handler(player->GetSession());
     std::vector<Item*> mailed;
+    uint32 mailedCount = 0;
+    std::string firstName;
 
     for (Item* item : rejected)
     {
@@ -950,7 +954,11 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
             player->StoreItem(dest, item, true);
 
             if (capped)
+            {
                 handler.PSendSysMessage("Can't store {} in this vault, please use the Main one.", name);
+                if (firstName.empty())
+                    firstName = name;
+            }
         }
         else
         {
@@ -975,7 +983,12 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
             {
                 handler.PSendSysMessage("Can't store {} in this vault, please use the Main one. "
                     "Your bags are full, so it has been mailed to you.", name);
+
+                if (firstName.empty())
+                    firstName = name;
             }
+
+            ++mailedCount;
         }
     }
 
@@ -995,6 +1008,30 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
         draft.SendMailTo(trans, player, MailSender(player, MAIL_STATIONERY_GM), MAIL_CHECK_MASK_COPIED);
     }
 
+    // A chat line is not enough. The item leaves the cursor and disappears from the bank in the
+    // same instant, which reads as item loss, and nobody is watching the chat frame mid-drag.
+    // Nothing here changes what was stored -- it only makes sure the player knows where the
+    // item went. See tools/TESTING.md for the swap-onto-an-occupied-slot route that reaches
+    // the mail case.
+    //
+    // A boss whisper is the whole mechanism. ChatHandler::SendNotification was tried alongside
+    // it and removed: observed in a stock client the two render almost identically, the whisper
+    // stays on screen longer, and the whisper is the one addons hook for an alert sound.
+    if (!firstName.empty())
+    {
+        std::string const notice = mailedCount
+            ? Acore::StringFormat("{} was sent to your mailbox - it cannot be stored in this vault.", firstName)
+            : Acore::StringFormat("{} cannot be stored in this vault - use the Main one.", firstName);
+
+        // Skipped when the banker GUID is the player's own, which is the GM .bank convention
+        // and has no creature behind it -- then the chat line above is all there is.
+        if (bankerGuid && bankerGuid != player->GetGUID())
+        {
+            if (Creature* banker = ObjectAccessor::GetCreature(*player, bankerGuid))
+                banker->Whisper(notice, LANG_UNIVERSAL, player, true);
+        }
+    }
+
     return true;
 }
 
@@ -1010,7 +1047,7 @@ void ExtendedBankMgr::FlushLiveVault(Player* player, ExtendedBankSession& sessio
     // Unconditional, not gated on the layout having changed: this also has to catch items
     // already sitting in a vault from before the rule existed, which arrive via AttachVault
     // and would otherwise look like an unchanged layout.
-    bool const evicted = EvictRestrictedItems(player, live, trans);
+    bool const evicted = EvictRestrictedItems(player, live, trans, session.BankerGuid);
     if (evicted)
     {
         live.clear();

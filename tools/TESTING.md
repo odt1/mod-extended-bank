@@ -192,6 +192,11 @@ the drain exists for. With a vault open, do the action, then check invariant 1.
       is the only known route -- a drag to an *empty* slot always leaves the source slot free,
       so the item just bounces back. Verified: item in mail exactly once, no character_inventory
       row, no vault row, displaced items intact in the bags, all invariants pass.
+- [ ] The rejection announcement itself. Besides the chat line, the banker sends a boss whisper
+      naming the item. Observed on a stock client it draws no chat bubble over the NPC -- it
+      renders as a full-screen system-style notice and triggers an addon alert sound, which is
+      what is wanted. `ChatHandler::SendNotification` was tried next to it and removed as a
+      near-duplicate that faded sooner. Re-check after any rebuild: chat line *and* whisper.
 - [ ] Same item into the **Main Vault**: must be allowed, since that is `character_inventory`
       and the core already counts it.
 - [ ] A vault holding such an item from before the rule existed: opening it evicts the item.

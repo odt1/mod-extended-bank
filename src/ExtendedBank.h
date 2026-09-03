@@ -216,7 +216,7 @@ private:
     // player's bags. Returns true if anything was moved, in which case the caller must
     // re-collect the live bank.
     bool EvictRestrictedItems(Player* player, std::vector<ExtendedBankItemPos> const& items,
-        CharacterDatabaseTransaction trans);
+        CharacterDatabaseTransaction trans, ObjectGuid bankerGuid);
 
     // True when something the vault used to hold is no longer in the live bank -- i.e. the
     // player moved it out. That is the only case that can strand an item between the two

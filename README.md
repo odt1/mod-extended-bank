@@ -371,6 +371,20 @@ rows need clearing.
   known and it may not be specific to this module; the frame is now closed explicitly before
   the bank opens, which is the most likely remedy. Worth knowing about because it looks alarming
   and invites a bug report about lost gold, when nothing has been lost.
+- **A rejected item is announced twice, because a chat line alone is not enough.** When a
+  capped item is refused, it leaves the cursor and vanishes from the bank in the same instant,
+  which reads as item loss to the player. The module therefore writes the detail to chat *and*
+  has the banker whisper it. The item is never actually lost: it is returned to the bags, or
+  — if there is nowhere to put it, which happens when the drop *swapped* with an occupied slot
+  and refilled the source — mailed.
+
+  The whisper is sent as a boss whisper (`Unit::Whisper(..., isBossWhisper = true)`). On a
+  stock 3.3.5a client that does *not* draw a chat bubble over the NPC — it renders as a
+  full-screen system-style notice, which is the desired effect anyway, and it is the form
+  addons hook to play an alert sound. `ChatHandler::SendNotification` was tried alongside it
+  and dropped: it looks almost the same and stays on screen for less time, so it added nothing.
+  A vault opened through the GM `.bank` convention has no banker creature, so there the chat
+  line is the only announcement.
 - **Conditions on an NPC's banker option are not re-applied to the vault list.** The module
   builds the NPC's normal menu, drops the core's `GOSSIP_OPTION_BANKER` entry and substitutes
   its own vault entries — but those carry no conditions of their own. On a banker whose bank
