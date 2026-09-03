@@ -221,6 +221,16 @@ the drain exists for. With a vault open, do the action, then check invariant 1.
 - [ ] Refund a recently bought item.
 - [ ] Buy an item back from a vendor.
 - [ ] Open a trade window with a vault open — switching must be refused.
+- [ ] **Trade completed while the *other* player has a vault open.** Two characters at a bank.
+      B opens vault 2 and drags an item inside it; A accepts the trade within the same second.
+      B's `character_inventory` bank rows must be unchanged and B's vault 2 layout intact.
+      *`HandleAcceptTradeOpcode` calls `SaveInventoryAndGoldToDB` on **both** players
+      (`TradeHandler.cpp:660,668`), and B's own packets never pass through `CanPacketReceive`
+      during A's accept. The hook now drains the partner on `CMSG_ACCEPT_TRADE` as well. Before
+      that, the window was one world tick — B's `OnPlayerUpdate` drain closes it otherwise — so
+      a negative result here proves little unless the timing is tight. Run it repeatedly.*
+- [ ] The same with the roles reversed, so the completing accept comes from the player who has
+      the vault open rather than from their partner.
 - [ ] Enter combat with a vault open — switching must be refused.
 - [ ] Loot a brand-new item straight into a vault's bank slot, then switch away immediately.
       *`ITEM_NEW` items have no `item_instance` row yet; this is the item-loss case.*

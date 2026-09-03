@@ -58,12 +58,35 @@ It is one `uint8` in session memory plus the banker's GUID. It is not a database
 never persisted, and is never read at login — on login the bank is vault 1 by definition,
 because `Player::_LoadInventory` just read `character_inventory`.
 
-It cannot be dropped, because **3.3.5a sends no packet when the bank frame closes**. There is
-no `CMSG_BANK_CLOSE`; the client simply hides the frame. "Swap only while the player is using
-the bank" has a clear start (`SMSG_SHOW_BANK`) but no client-supplied end, so the server needs
-its own way to notice that the interaction is over. Reverting to vault 1 happens on the first
-of: picking another vault, walking out of the banker's interaction range (checked once a
-second), changing map, or logging out.
+It cannot be dropped, because **3.3.5a sends no packet when the bank frame closes**. The entire
+player-bank opcode surface is `CMSG_BANKER_ACTIVATE`, `SMSG_SHOW_BANK`, `CMSG_BUY_BANK_SLOT` and
+`SMSG_BUY_BANK_SLOT_RESULT` — there is no close in either direction, and the core has no notion
+of one either: `WorldSession::m_currentBankerGUID` is set in `SendShowBank`
+(`BankHandler.cpp:188`) and never cleared. "Swap only while the player is using the bank" has a
+clear start but no client-supplied end, so the server needs its own way to notice the
+interaction is over. Reverting to vault 1 happens on the first of: picking another vault,
+walking out of the banker's interaction range (checked once a second), changing map, or logging
+out.
+
+#### Why the range check is the right substitute, and not merely the available one
+
+`GetNPCIfCanInteractWith` tests `INTERACTION_DISTANCE` (5.5f, `ObjectDefines.h:24`), which is
+the distance at which **the client closes the bank frame by itself**. So losing the banker is
+not a proxy for "the frame closed" — it is the same event, for every close except pressing
+Escape while standing still.
+
+That one remaining case leaves a vault live while the player stands there. It costs nothing in
+storage terms — `character_inventory` is untouched and a crash is no worse than vanilla — but
+core code counting the bank (`GetItemCount(..., inBankAlso)`, uniqueness checks, quest
+turn-ins) sees the open vault rather than vault 1 for as long as it lasts.
+
+Narrowing it is tempting and every available lever is worse than the gap. There is no `SMSG` to
+close the bank frame either, so any speculative revert — an idle timeout being the obvious
+one — can fire while the frame is genuinely open, and the player then watches vault 1's items
+appear inside a frame they believe is vault 5. Nothing is lost, since the next drag acts on
+real slots, but it is an unexplainable event of exactly the shape that produces "the module ate
+my items" reports. An idle timeout is in fact at its worst for a player who went AFK with the
+frame open, which is the commonest way to reach the case it is meant to fix.
 
 ### Exactly where the swap happens
 
@@ -129,16 +152,44 @@ transition looks the same for vault 1 and vault 5.
 `OnPlayerSave` alone is **not** enough, and relying on it was this module's original mistake.
 `Player::SaveToDB` is not the only route to `_SaveInventory`:
 `Player::SaveInventoryAndGoldToDB` (`PlayerStorage.cpp:7304`) calls it directly and fires no
-hook at all. Its callers include mail (`ItemHandler.cpp:1205`), the auction house
-(`AuctionHouseHandler.cpp:327,401,589,662`), the guild bank (`Guild.cpp:791,805`), item refunds
-(`Player.cpp:16146`) and the partial-save timer (`PlayerUpdates.cpp:2431`). So the module
-drains at three points, which between them precede every one of those:
+hook at all. Every one of its call sites:
+
+| Site | What | Whose inventory |
+|---|---|---|
+| `AuctionHouseHandler.cpp:327,401,589,662` | sell, bid, buyout, cancel | the sender |
+| `Guild.cpp:791,805` | guild bank deposit/withdraw | the sender |
+| `MailHandler.cpp:374,621` | send mail, take attached item | the sender |
+| `ItemHandler.cpp:1205` | gift wrapping | the sender |
+| `SpellHandler.cpp:318` | open item | the sender |
+| `Player.cpp:16146` | `Player::RefundItem` | the sender |
+| `PlayerUpdates.cpp:2431` | partial-save timer | itself |
+| `TradeHandler.cpp:656,667` | trade accept | the sender |
+| **`TradeHandler.cpp:660,668`** | **trade accept** | **the trade partner** |
+| `TC9GrpcHandler.cpp:140,199` | cluster sidecar | any player, by GUID |
+
+Vendor buyback is deliberately absent: `HandleBuybackItem` does `RemoveItemFromBuyBackSlot` +
+`StoreItem` and goes through the ordinary update queue, so it never reaches this function.
+
+So the module drains at three points, which between them precede every one of those:
 
 | Where | Covers |
 |---|---|
 | `ServerScript::CanPacketReceive`, before every packet handler runs | every handler that reaches `SaveInventoryAndGoldToDB`, including one that fires in the same batch as the packet that dirtied the item |
+| the same hook, on `CMSG_ACCEPT_TRADE`, draining the **trade partner** as well | the one save that is not the packet sender's |
 | `OnPlayerUpdate` (`PlayerUpdates.cpp:315`) | `UpdateAdditionalSaves` at `:340` in the same `Player::Update` |
 | `OnPlayerSave` | full character saves |
+
+The trade partner is the exception that proves why per-packet draining is not enough on its
+own. `HandleAcceptTradeOpcode` saves *both* sides, and the partner's own packets never pass
+through this hook during the accept. Their `OnPlayerUpdate` drain still runs every world tick,
+so the exposure was never more than one tick — but `MapUpdate.Threads` is greater than one on
+most realms, and one tick is all it takes. Reaching across to another player from a packet hook
+is safe here specifically because `CMSG_ACCEPT_TRADE` is `PROCESS_THREADUNSAFE`: it runs only in
+`World::UpdateSessions`, which does not overlap the `MapUpdater` pool.
+
+`TC9GrpcHandler` cannot be covered at all — it saves an arbitrary player by GUID over gRPC with
+no packet to precede. It is gated behind `Cluster.Enabled`, which defaults to `false`, so it is
+inert unless the realm runs in cluster mode.
 
 The drain is a lock-free atomic check unless the player actually has a vault open, and beyond
 that it compares the live bank against the layout last written and returns without touching the
@@ -367,6 +418,22 @@ rows need clearing.
 - **`.pdump` does not know about the module tables.** A dumped and reloaded character loses
   vaults 2..N.
 - **Playerbots** read `BANK_SLOT_*` directly and always see vault 1, which is unaffected.
+- **Switching is refused in combat and during a trade; the automatic reverts are not.** That
+  asymmetry is deliberate. The guard is UX — it stops a player *choosing* to swap at a silly
+  moment — and it is not a safety property, so the reverts triggered by walking away, changing
+  map or logging out do the identical detach with no check. Adding the guard to those would be
+  strictly worse: a revert that refuses leaves a vault live after the player has left the
+  banker, which breaks the resting-state invariant everything else depends on.
+
+  The trade half is not quite theatre. `HandleSetTradeItemOpcode` resolves its position with
+  `_player->GetItemByPos(bag, slot)` (`TradeHandler.cpp:895`) and performs no position-class
+  check, and `Player::GetItemByPos` returns `m_items[slot]` for any slot below
+  `BANK_SLOT_BAG_END` — the whole bank — while `GetBagByPos` accepts bank bag slots too. So a
+  forged `CMSG_SET_TRADE_ITEM` can put a vault item into a trade. The consequence is mild
+  because `TradeData` stores `ObjectGuid`, not `Item*`, and resolves through
+  `Player::GetItemByGuid`: once the module frees the item during a revert that resolves to
+  `nullptr`, and every use site in `HandleAcceptTradeOpcode` is null-checked. The item silently
+  drops out of the trade. No dangling pointer, no duplication.
 - **Items the game caps per character are not allowed in vaults 2..N.** `MaxCount` and
   `ItemLimitCategory` are enforced by counting `character_inventory`, and a stowed vault is
   invisible to that count — so parking a unique or quest item in a vault would let its owner

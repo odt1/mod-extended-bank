@@ -13,6 +13,7 @@
 #include "ScriptMgr.h"
 #include "ScriptedGossip.h"
 #include "StringFormat.h"
+#include "TradeData.h"
 #include "Opcodes.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
@@ -292,6 +293,23 @@ public:
         // is the only interception point a module has. It costs one atomic load unless
         // this player actually has a vault open.
         sExtendedBankMgr->DrainUpdateQueue(player);
+
+        // The one handler that saves somebody *else*. HandleAcceptTradeOpcode calls
+        // trader->SaveInventoryAndGoldToDB (TradeHandler.cpp:660,668) on the partner, whose own
+        // packets this hook never sees, so a vault item they dirtied within the last tick would
+        // be written straight into their character_inventory. Both sides send CMSG_ACCEPT_TRADE
+        // and only the second one completes the trade, so draining the partner on every one of
+        // them covers whichever it turns out to be.
+        //
+        // Safe to touch another player's items from here: the opcode is PROCESS_THREADUNSAFE,
+        // so it runs only in World::UpdateSessions, which does not overlap the MapUpdater pool.
+        if (packet.GetOpcode() == CMSG_ACCEPT_TRADE)
+        {
+            if (TradeData* trade = player->GetTradeData())
+                if (Player* trader = trade->GetTrader())
+                    if (trader->IsInWorld())
+                        sExtendedBankMgr->DrainUpdateQueue(trader);
+        }
 
         if (packet.GetOpcode() != CMSG_BANKER_ACTIVATE || !sExtendedBankConfig.IsEnabled())
             return true;
