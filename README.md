@@ -1,17 +1,17 @@
 # mod-extended-bank
 
-Blanced, vanilla-like bank space extension module that adds new bank pages or **vaults**. No client addon, no custom frame, no client patch: pick a vault page from the banker's new gossip/dialogue window and the ordinary bank UI opens showing that vault's contents.
+Balanced, vanilla-like bank space extension module that adds new bank pages or **vaults**. No client addon, no custom frame, no client patch: pick a vault page from the banker's new gossip/dialogue window and the ordinary bank UI opens showing that vault's contents.
 
 - Vaults 2 to 8 (by default) are the new _extra_ banks, each with its own usual 28 item slots and its own 7 purchasable bank bag slots using the original vanilla system and UI.
 - Vault 1 is the character's normal bank and its storage is never modified by this module.
-- New vaults/pages are purchased with the same dialogue menu, and by default are at extremely steep prices for the gold sink mechanic and balance reasons. 
+- New vaults/pages are purchased with the same dialogue menu, and by default are at extremely steep prices for the gold sink mechanic and balance reasons.
 - Vaults can be renamed, colour codes and inline icons supported.
 
-## Disclamer:
+## Disclaimer
 
-Vibe-coded using Claude Opus 5 against [AzerothCore mod-playerbots branch](https://github.com/mod-playerbots/azerothcore-wotlk/tree/Playerbot), but rigorously tested on solo server as much as possible (see tools\TESTING.md). 
+Vibe-coded using Claude Opus 5 against [AzerothCore mod-playerbots branch](https://github.com/mod-playerbots/azerothcore-wotlk/tree/Playerbot), but rigorously tested on solo server as much as possible (see tools\TESTING.md).
 
-Please feel free to report any issues, PRs and provide any reports and additional testing, thanks and enjoy! 
+Please feel free to report any issues, PRs and provide any reports and additional testing, thanks and enjoy!
 
 ## How it works
 
@@ -170,7 +170,7 @@ hook at all. Every one of its call sites:
 Vendor buyback is deliberately absent: `HandleBuybackItem` does `RemoveItemFromBuyBackSlot` +
 `StoreItem` and goes through the ordinary update queue, so it never reaches this function.
 
-So the module drains at three points, which between them precede every one of those:
+So the module drains at four points, which between them precede every one of those:
 
 | Where | Covers |
 |---|---|
@@ -306,6 +306,12 @@ is left untouched.
 Vault entries carry a module-private gossip `sender`, so anything else falls through to the
 core handler unchanged.
 
+Because the vault list stands in for the banker option, it is offered **only where that option
+is**. If the menu the core built contains no `GOSSIP_OPTION_BANKER` entry — which is how the
+core says this player may not bank here — the module changes nothing and hands the NPC back, so
+the result is identical to the module not being installed. See *Known consequences* for why that
+is the whole of the condition handling.
+
 ### How the menu is reached on a banker with no gossip flag
 
 Most banker NPCs have `UNIT_NPC_FLAG_BANKER` but not `UNIT_NPC_FLAG_GOSSIP`. For those the
@@ -373,6 +379,11 @@ The truncated string is what goes into both the database and the in-memory cache
 the untruncated name to the cache is what previously turned an over-length rename into a
 permanently broken gossip window: the `UPDATE` failed with MySQL error 1406 (`Data too long
 for column 'name'`) while the menu kept re-sending the name the database had rejected.
+
+Confirmed against a long Cyrillic name typed into the client: it stored as exactly 240
+characters and 480 bytes, a clean two bytes per character, so the cut fell on a boundary and
+nothing was mangled. Note that `VARCHAR(255)` counts characters rather than bytes in MySQL, so
+the 480-byte name fits comfortably — the character count is the only thing 240 has to respect.
 
 ## Installation
 
@@ -519,14 +530,20 @@ rows need clearing.
   and dropped: it looks almost the same and stays on screen for less time, so it added nothing.
   A vault opened through the GM `.bank` convention has no banker creature, so there the chat
   line is the only announcement.
-- **Conditions on an NPC's banker option are not re-applied to the vault list.** The module
-  builds the NPC's normal menu, drops the core's `GOSSIP_OPTION_BANKER` entry and substitutes
-  its own vault entries — but those carry no conditions of their own. On a banker whose bank
-  access is gated (Jeeves, entry 35642, requires Master Engineering) the vault list is offered
-  to everyone, and selecting one opens the bank. The fix is to add vault entries only when the
-  core actually produced a banker option, since that is what proves the conditions were met —
-  but it needs checking against plain bankers first, because it would suppress the menu
-  anywhere that option is not generated.
+- **Conditions on an NPC's banker option are honoured, by inheriting the core's answer.** The
+  vault list stands in for the stock `GOSSIP_OPTION_BANKER` entry, so it is offered only where
+  that entry is. `Player::PrepareGossipMenu` omits an option whose `conditions` row fails
+  (`PlayerGossip.cpp:58`) and applies no further check to a banker option, so one surviving into
+  the built menu *is* the core's statement that this player may use this bank. When none does,
+  the module returns false and the NPC is handed back untouched — the core re-runs
+  `PrepareGossipMenu`, which is idempotent, and sends the menu through `SendPreparedGossip`,
+  whose quest-menu fallback and menu-aware text id the module does not try to reproduce.
+
+  Jeeves (entry 35642) is the only creature in the stock database that gates a banker option —
+  `CONDITION_SKILL 202/350`, Master Engineering — and until this was added the vault list handed
+  his bank to anyone who could reach him. The check costs nothing anywhere else: of 55 bankers,
+  14 carry the gossip flag, and every one of them produces a banker option, four of them through
+  the default menu 0 fallback that fires when a creature's own menu has no options at all.
 - **A vault opened by a scripted NPC is skipped.** A banker whose `creature_template` carries
   a `ScriptName` is left entirely alone, so it keeps its own gossip and gains no vault list.
   `ScriptMgr::OnGossipHello` asks every `AllCreatureScript` first and stops at the first one

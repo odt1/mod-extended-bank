@@ -72,7 +72,10 @@ namespace
 
 namespace
 {
-    void SendMainMenu(Player* player, Creature* creature)
+    // Returns false when this player must not be offered a vault list on this creature. The
+    // menu is then left exactly as PrepareGossipMenu built it and nothing has been sent, so the
+    // caller can hand the NPC back to the core untouched.
+    bool SendMainMenu(Player* player, Creature* creature)
     {
         ObjectGuid const playerGuid = player->GetGUID();
         std::vector<uint8> const owned = sExtendedBankMgr->GetOwnedVaults(playerGuid);
@@ -84,11 +87,23 @@ namespace
         GossipMenu& menu = player->PlayerTalkClass->GetGossipMenu();
         std::vector<CarriedGossipItem> carried;
 
+        // The vault list stands in for the stock banker option, so it may only be offered where
+        // that option was. PrepareGossipMenu drops an option whose `conditions` row fails
+        // (PlayerGossip.cpp:58), and GOSSIP_OPTION_BANKER has no other check, so a banker
+        // option surviving into the built menu is the core's own statement that this player may
+        // use this bank. Jeeves (35642) is the only creature in the stock database that gates
+        // one -- CONDITION_SKILL 202/350, Engineering 350 -- and without this the vault list
+        // handed his bank to anyone.
+        bool bankerOffered = false;
+
         for (auto const& menuPair : menu.GetMenuItems())
         {
             // The vault list replaces the stock banker option; everything else is kept.
             if (menuPair.second.OptionType == GOSSIP_OPTION_BANKER)
+            {
+                bankerOffered = true;
                 continue;
+            }
 
             CarriedGossipItem entry;
             entry.Item = menuPair.second;
@@ -101,6 +116,11 @@ namespace
 
             carried.push_back(std::move(entry));
         }
+
+        // Nothing has been changed yet -- the loop above only read -- so the menu the core
+        // would have built is still intact for it to send.
+        if (!bankerOffered)
+            return false;
 
         // GossipMenu::ClearMenu leaves the quest menu alone, unlike ClearGossipMenuFor.
         menu.ClearMenu();
@@ -160,6 +180,7 @@ namespace
         }
 
         SendGossipMenuFor(player, player->GetGossipTextId(creature), creature);
+        return true;
     }
 }
 
@@ -201,8 +222,11 @@ public:
         if (!ClaimsBanker(creature))
             return false;
 
-        SendMainMenu(player, creature);
-        return true;
+        // Returning false hands the NPC back to the core, which re-runs PrepareGossipMenu --
+        // idempotent, it opens with ClearMenus -- and then SendPreparedGossip, whose quest-menu
+        // fallback and menu-aware text id this module does not reproduce. Letting the core send
+        // it is what makes a refusal indistinguishable from the module not being installed.
+        return SendMainMenu(player, creature);
     }
 
     bool CanCreatureGossipSelect(Player* player, Creature* creature, uint32 sender, uint32 action) override
@@ -224,15 +248,21 @@ public:
 
         switch (action)
         {
+            // A refusal here can only mean the player stopped meeting the banker option's
+            // conditions while the menu was open -- unlearning Engineering at Jeeves, say. The
+            // menu is already ours at this point and the core will not send anything, so close
+            // it rather than leave a stale one on screen.
             case EXTENDED_BANK_ACTION_BUY:
                 sExtendedBankMgr->BuyNextVault(player);
-                SendMainMenu(player, creature);
+                if (!SendMainMenu(player, creature))
+                    CloseGossipMenuFor(player);
                 break;
             case EXTENDED_BANK_ACTION_RENAME_MENU:
                 SendRenameMenu(player, creature);
                 break;
             case EXTENDED_BANK_ACTION_MAIN_MENU:
-                SendMainMenu(player, creature);
+                if (!SendMainMenu(player, creature))
+                    CloseGossipMenuFor(player);
                 break;
             default:
                 CloseGossipMenuFor(player);
@@ -327,7 +357,14 @@ public:
         player->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TALK);
         creature->PauseMovementForInteraction();
 
-        SendMainMenu(player, creature);
+        // A creature reaching this path has no gossip flag, so its banker option comes from the
+        // default menu 0 fallback, which carries no conditions -- the check passes for every
+        // plain banker. If it ever does not, letting the packet through to the stock handler is
+        // the correct answer: WorldSession::HandleBankerActivateOpcode tests nothing but
+        // CanUseBank, so the core would open that bank too, and refusing here would be stricter
+        // than the game.
+        if (!SendMainMenu(player, creature))
+            return true;
 
         // Swallow the packet: the bank frame is opened from the vault the player picks.
         return false;

@@ -1,11 +1,23 @@
 # mod-extended-bank — test plan
 
-**Verified 2026-09-02**, with the delta flush re-verified **2026-09-03**, against a live realm
-(`Admin`, guid 3002) driven over SOAP plus direct read-only SQL. `[x]` means observed passing, not reasoned about. Unticked entries are genuinely
-untested — several are marked with why.
+Tested against a live realm across **2026-09-02** and **2026-09-03**, driven from a game client
+plus SOAP GM commands and read-only SQL. Characters used: `Admin` (3002), `Radmin`, and for the
+trade work two ordinary ones, `Test` (24008) and `Testthree` (24010) — GM accounts cannot trade.
 
 Every entry says what it *proves*, not just what to click. The happy path is marked as such; the
 value is in the rest.
+
+**How to read the boxes.** `[x]` means observed passing, never reasoned about. An unticked box is
+one of three things, and the entry says which:
+
+- *genuinely pending* — worth doing, nobody has;
+- *not reachable* — the state cannot be produced from a client, and the entry says why (the
+  trade race, a restricted bag with contents, the mail/auction reach-in);
+- *covered by construction* — a static argument settles it and clicking adds little. §10's
+  handler list is the main example.
+
+That distinction matters more than the count. Most of what is still unticked is closed, not
+outstanding.
 
 Run `tools/check_invariants.sql` after anything that moves an item. Zero rows is a pass:
 
@@ -71,10 +83,25 @@ them belongs to the current run.
 - [ ] A banker that is also a questgiver: its quests are still listed. *Proves `ClearMenu` was
       used rather than `ClearGossipMenuFor`, which also wipes the quest menu.*
 - [ ] A banker with a `ScriptName`: the module stays out entirely and the NPC's own script runs.
+- [x] **Jeeves (35642) without Master Engineering**: no vault list, and his menu is exactly what
+      it is with the module disabled — "Let me browse your goods." only. *He is the only
+      creature in the stock database with a condition on a banker option
+      (`CONDITION_SKILL 202/350`).*
+- [x] Jeeves **with** Engineering 350: the vault list appears and vaults open normally.
+- [x] A banker whose own gossip menu has no options at all — Novia (16615), Periel (16616),
+      Ceera (17631) or Elana (17632), all `npcflag` 131073 on map 530. Their banker option comes
+      from the default menu 0 fallback, so the vault list must still appear. *This is the case
+      the condition gate could plausibly have broken.* Verified 2026-09-03 in Silvermoon and
+      the Exodar.
       *Proves the `GetScriptId()` guard.*
-- [ ] Own the maximum vaults on a banker with many DB gossip options, so the menu would exceed
+- [x] Own the maximum vaults on a banker with many DB gossip options, so the menu would exceed
       32 entries. **This is a crash test** — `GossipMenu::AddMenuItem` asserts past
       `GOSSIP_MAX_MENU_ITEMS`. Expect a clean warning naming the number actually dropped.
+      *Established 2026-09-03 as unreachable on a stock database: the richest banker menu in the
+      game is Jeeves, and he contributes one carried option beside the vault list. Every
+      `AddGossipItemFor` in this module is already behind `CanAddMenuItem`, and the carried-item
+      loop logs how many it dropped, so the guard is there for a modded realm rather than for
+      anything shipped.*
 - [ ] Selecting a vault closes the gossip window with nothing left behind.
 
 ## 3. The storage invariant
@@ -161,16 +188,22 @@ The section that matters most.
 - [ ] An inline icon: `|TInterface\Icons\INV_Misc_Bag_08:16|t Alts`.
 - [x] Paste a very long name. Truncated to 240 characters, the gossip window still renders, and
       **no MySQL 1406** in `Errors.log`. *This is the bug that broke the UI outright.*
-- [ ] A name of multi-byte characters (Cyrillic, CJK) at the limit: truncation lands on a
+- [x] A name of multi-byte characters (Cyrillic, CJK) at the limit: truncation lands on a
       character boundary, never mid-sequence. **Client only** — the console/SOAP layer mangles
       non-ASCII to `?` before the module sees it, so this cannot be driven from a harness.
+      Verified 2026-09-03 with a long Cyrillic name typed in the client: stored as exactly 240
+      characters / 480 bytes, a clean 2 bytes per character throughout, so `utf8truncate` cut on
+      a boundary with no partial sequence and nothing mangled. `VARCHAR(255)` counts characters
+      rather than bytes in MySQL, so 240 fits — which is what the original `[1406] Data too
+      long` failure was about.
 - [ ] Rename vault 1 — the label changes, its storage does not.
 - [x] Rename to an empty string: falls back to `Vault N`.
 
 ## 7. Lifecycle
 
-- [ ] Open vault 2, walk out of range. Within ~1s the live bank is vault 1 again — verify from a
-      *different* banker and by a `character_inventory` diff after `.save`.
+- [x] Open vault 2, walk out of range. Within ~1s the live bank is vault 1 again — verify from a
+      *different* banker and by a `character_inventory` diff after `.save`. Confirmed
+      2026-09-03 with `.vault info`, which reports the live vault directly.
 - [x] Open vault 2, `.tele` away. Reverted on arrival.
 - [ ] Open vault 2 and hearthstone out **mid-cast**, then again while the teleport is in flight.
       *`Player::SaveToDB` no-ops during a far teleport; the module deliberately does not depend
@@ -293,8 +326,22 @@ Two genuine exceptions were found by that sweep and are listed separately: the t
       trade, then complete without touching the banker again. Treat the entries above as a
       safety check on reaching across to another `Player` from a packet hook, not as a bug hunt.
 - [ ] Enter combat with a vault open — switching must be refused.
-- [ ] Loot a brand-new item straight into a vault's bank slot, then switch away immediately.
-      *`ITEM_NEW` items have no `item_instance` row yet; this is the item-loss case.*
+- [x] Loot a brand-new item straight into a vault's bank slot, then switch away immediately.
+      *`ITEM_NEW` items have no `item_instance` row yet; this is the item-loss case.* **Not
+      reachable**: both the default UI and ElvUI refuse to place an item from a loot window into
+      a bank slot, so a looted item always lands in the bags first.
+- [x] The reachable form of the same case: loot an item, then drag it from the bags into a vault
+      *before* anything saves, so it reaches the vault still `ITEM_NEW`. `PersistVaultLayout`
+      writes the vault row before `Item::SaveToDB` creates the `item_instance` row, which is
+      safe only because both are in one transaction — worth knowing before anyone reorders that
+      function.
+      Verified 2026-09-03: a looted Weather-Beaten Journal (34109) dragged straight into vault 2
+      landed at slot 44 with a matching `item_instance` row, correct owner and count, no
+      `character_inventory` row, all invariants clean and nothing in `Errors.log`. The window is
+      wider than it looks and the test almost certainly hit it — storing an item arms
+      `m_additionalSaveTimer = 2000` (`PlayerStorage.cpp:7299`), so there are two full seconds
+      before anything writes `item_instance`, and the module's own per-tick drain never touches
+      items in the bags.
 - [ ] A stack that merges on attach because the target slot already holds the same item.
 - [x] Put a unique or quest item (any with `item_template.maxcount > 0` or a non-zero
       `ItemLimitCategory`) into a non-default vault. It must bounce back to the bags with a
@@ -326,3 +373,23 @@ Two genuine exceptions were found by that sweep and are listed separately: the t
 - [ ] A rename for a vault you do not own.
 - [ ] `CMSG_BANKER_ACTIVATE` for a creature that is not a banker, and for one out of range.
 - [x] Vault switches spammed as fast as the client will send them.
+
+## What is left
+
+Short list, so the 40-odd unticked boxes above do not read as a backlog.
+
+**Genuinely pending, reachable:** the remaining §5 purchase edge cases; §6 rename of a vault you
+do not own; `.pdump` round-trip; a stack that merges on attach; §9's multi-character concurrency
+entries beyond the ones already run.
+
+**Not reachable from a client, and why:** the trade-partner race (the bank and trade frames
+cannot both be open, and hiding the trade frame cancels the trade); a restricted *bag* with
+ordinary contents inside a vault; the mail/auction reach-in that `SelfHealVaultRows` repairs.
+Each needs a forged packet or an instrumented build.
+
+**Closed by construction, not by clicking:** §10's handler list — `opHandle->Call` exists in
+four places in the server and every one is preceded by the drain; §2's menu overflow — the
+richest banker menu in the game contributes one option beside the vault list.
+
+**Out of scope:** ElvUI's bank bag slot purchase button, which stops appearing once the Main
+Vault owns all seven slots. Not reproducible on the default UI.

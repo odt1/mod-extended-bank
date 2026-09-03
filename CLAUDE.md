@@ -31,6 +31,16 @@ The module never composes a `character_inventory` row itself. It reaches that ta
 through core helpers: `Item::DeleteFromInventoryDB` for an item taken *into* a vault, and
 `Player::SaveInventoryAndGoldToDB` so the *core* writes rows for items that left one.
 
+`SelfHealVaultRows` is the insurance: at login it drops any vault row whose item has turned up
+somewhere the core owns — `character_inventory`, `mail_items`, `auctionhouse` or
+`guild_bank_item`. The last three matter because `Player::GetItemByGuid` scans bank slots and
+bank bags (`PlayerStorage.cpp:423,435`), so `CMSG_SEND_MAIL` and `CMSG_AUCTION_SELL_ITEM` can
+take an item straight out of an open vault; the drain handles that correctly, and this covers a
+crash inside the tick before it runs. Login is the only safe moment for the check — reads take a
+synchronous connection while writes commit on the async pool, so running it mid-session could
+see a row whose deletion is queued but not executed. It is skipped entirely for characters who
+own no vault beyond the default, which is most of a realm.
+
 ## The part that is easy to get wrong
 
 **Keeping vault items out of `Player::m_itemUpdateQueue` is the whole design.**
@@ -40,15 +50,24 @@ live vault item is queued when it runs, it writes `REPLACE INTO character_invent
 
 `Player::SaveToDB` is *not* the only route to `_SaveInventory`.
 `Player::SaveInventoryAndGoldToDB` (`PlayerStorage.cpp:7304`) calls it directly and fires **no
-hook at all** — its callers include mail, auction house, guild bank, item refund, vendor
-buyback and the partial-save timer. Hooking `OnPlayerSave` alone was this module's original bug.
-The drain therefore runs at three points that between them precede every one of those:
+hook at all** — mail, auction house, guild bank, item refund, gift wrapping, open-item, trade
+and the partial-save timer all reach it. (Vendor buyback does *not*: `HandleBuybackItem` goes
+through the ordinary update queue. An earlier revision of this file claimed otherwise.) Hooking
+`OnPlayerSave` alone was this module's original bug. The drain runs at four points:
 
 | Where | Covers |
 |---|---|
 | `ServerScript::CanPacketReceive`, before every packet handler | every handler reaching `SaveInventoryAndGoldToDB`, including one in the same batch as the packet that dirtied the item |
+| the same hook, on `CMSG_ACCEPT_TRADE`, draining the **partner** too | `HandleAcceptTradeOpcode` saves both sides (`TradeHandler.cpp:660,668`); the partner's own packets never pass through this hook during someone else's accept |
 | `OnPlayerUpdate` (`PlayerUpdates.cpp:315`) | `UpdateAdditionalSaves` at `:340` in the same `Player::Update` |
 | `OnPlayerSave` | full character saves |
+
+That covers everything, and the reason is checkable rather than hopeful: `opHandle->Call`
+appears in exactly four places in the whole server (`WorldSession.cpp:470,491,504,523`, the four
+dispatching arms of one switch), each immediately preceded by `CanPacketReceive`, and
+`WorldSocket::ProcessIncoming` only queues. The single exception is `TC9GrpcHandler`, which
+saves an arbitrary player over gRPC with no packet to precede; it is gated behind
+`Cluster.Enabled`, default false.
 
 Other landmines, each already paid for once:
 
@@ -63,6 +82,16 @@ Other landmines, each already paid for once:
 - **The core's inventory save is expensive and has side effects** — buyback purge, position
   cheat-detection that can mark an item `ITEM_REMOVED`, full queue clear. It belongs only where
   `Item` objects are about to be freed, or where an item has just left a vault.
+- **`PersistVaultLayout` writes a delta, and its deletes must all precede its inserts.** Two
+  items swapping places inside a vault collide on `UNIQUE KEY (owner_guid, vault, bag, slot)`
+  otherwise — the first `INSERT` lands on a slot its previous occupant has not vacated — and the
+  whole transaction aborts. Because commits are asynchronous, that abort is invisible in game:
+  the vault silently reverts to its last flush. `Errors.log` is the only place it shows.
+- **The vault row and the `item_instance` row must stay in one transaction.** An item dragged
+  into a vault within two seconds of being looted is still `ITEM_NEW` and has no `item_instance`
+  row yet (`m_additionalSaveTimer = 2000`, `PlayerStorage.cpp:7299`). `PersistVaultLayout`
+  writes the vault row *before* `Item::SaveToDB` creates that row, which is safe only because
+  both are in the same transaction. Splitting them would strand items looted seconds earlier.
 - **`Player::Update` runs on the `MapUpdater` pool.** With `MapUpdate.Threads > 1`, two players
   on different maps reach the manager's containers in the same tick. Every entry point takes a
   `std::recursive_mutex`; the two hot hooks check an `std::atomic` count first.
@@ -84,6 +113,17 @@ Two entry points reach the gossip menu, and both must keep working: bankers *wit
 `CMSG_BANKER_ACTIVATE` and are intercepted in `CanPacketReceive`. Creatures with a `ScriptName`
 are deliberately left alone — `ScriptMgr::OnGossipHello` stops at the first `AllCreatureScript`
 returning true, so claiming one would suppress its own script.
+
+The vault list stands in for the stock `GOSSIP_OPTION_BANKER` entry, so it is offered **only
+where that entry is**. `PrepareGossipMenu` omits an option whose `conditions` row fails
+(`PlayerGossip.cpp:58`) and applies no further check to a banker option, so one surviving into
+the built menu is the core's own statement that this player may bank here — no condition
+evaluation is duplicated. On refusal `SendMainMenu` returns false having changed nothing, and
+the core re-runs `PrepareGossipMenu` (idempotent; it opens with `ClearMenus`) and sends through
+`SendPreparedGossip`, whose quest-menu fallback and menu-aware text id this module does not
+reproduce. Jeeves (35642) is the only creature in the stock database that gates a banker option.
+Four bankers get theirs from the default menu 0 fallback rather than their own menu, which fires
+when a creature's menu has no options at all — do not break that path.
 
 ## Commands
 
@@ -122,8 +162,17 @@ uses the player's own GUID as the banker, the GM `.bank` convention that
 
 Item *movement* still needs a real client; SOAP cannot drag things between slots.
 
-**Two instrumentation traps.** `Logger.module` defaults to `4` (WARN+), which silences the
-module's `LOG_INFO` recovery lines. Even at `3`, `Appender.Server=2,5,...` filters the *file* at
-ERROR, so INFO reaches only the console window — "no module lines in `Server.log`" proves only
-that no module *errors* occurred. Non-ASCII text is mangled to `?` by the console/SOAP layer
-before the module sees it, so multi-byte name handling cannot be tested from a harness.
+**Logging, and where to actually look.** `Logger.module` defaults to `4` (WARN+), which silences
+the module's `LOG_INFO` recovery lines, and the shipped `Appender.Server` filters the *file* at
+ERROR — with both at their defaults, "no module lines in `Server.log`" proves only that no
+module *errors* occurred. Set `Logger.module=3` **and** `Appender.Server=2,3,...` before reading
+anything into an empty log.
+
+A failed statement never appears there at all: `Logger.sql.sql` routes to the **Errors**
+appender, so `Errors.log` is where an aborted flush shows up, with its SQL. Both files open in
+`w` mode and truncate at startup, so their contents always belong to the current run. This
+matters more than it sounds — commits are asynchronous, so a failed flush is completely silent
+in game and the vault merely appears to revert an edit.
+
+Non-ASCII text is mangled to `?` by the console/SOAP layer before the module sees it, so
+multi-byte name handling can only be tested from a real client.
