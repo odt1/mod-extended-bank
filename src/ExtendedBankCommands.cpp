@@ -46,9 +46,11 @@ namespace
 
     // Resolves the argument, or the selected player, or the invoker. Over SOAP there is no
     // session and no selection, so a name is required there.
-    Player* ResolveTarget(ChatHandler* handler, Optional<PlayerIdentifier> const& target)
+    //
+    // By value: every caller has its own Optional to give away, so taking a reference only to
+    // copy it inside bought nothing.
+    Player* ResolveTarget(ChatHandler* handler, Optional<PlayerIdentifier> resolved)
     {
-        Optional<PlayerIdentifier> resolved = target;
         if (!resolved)
             resolved = PlayerIdentifier::FromTargetOrSelf(handler);
 
@@ -129,7 +131,11 @@ namespace
 
         ObjectGuid const guid = player->GetGUID();
         ObjectGuid::LowType const lowGuid = guid.GetCounter();
-        uint8 const active = sExtendedBankMgr->GetActiveVault(guid);
+
+        // One read, so the vault this function checks and the row-presence flag it checks it
+        // against cannot come from two different acquisitions of the manager's lock.
+        ExtendedBankDebugState const state = sExtendedBankMgr->GetDebugState(guid);
+        uint8 const active = state.ActiveVault;
         uint32 failures = 0;
 
         std::vector<ExtendedBankItemPos> live;
@@ -209,12 +215,31 @@ namespace
 
         // 5. The live bank bag slot count must match what is stored for the active vault, or a
         //    crash here would make the core mail that vault's bank bags back at next login.
-        uint8 const storedSlots = sExtendedBankMgr->GetVaultBagSlots(guid, active);
-        if (storedSlots != player->GetBankBagSlotCount())
+        //    A missing metadata row is only benign for the default vault on a character who
+        //    has never bought or opened one -- SwitchTo calls EnsureDefaultVaultRow, so anyone
+        //    who has switched has a row. For any other vault a missing row is itself the
+        //    fault: it is what stops LoadPlayer restoring PLAYER_BYTES_2, after which the core
+        //    mails that vault's bank bags back.
+        if (!state.HasVaultRow && active != EXTENDED_BANK_DEFAULT_VAULT)
         {
-            handler->PSendSysMessage("FAIL bag-slot-mismatch: vault {} stores {}, live is {}",
-                active, storedSlots, player->GetBankBagSlotCount());
+            handler->PSendSysMessage("FAIL missing-vault-row: vault {} is open with no metadata row.",
+                active);
             ++failures;
+        }
+        else if (!state.HasVaultRow)
+        {
+            handler->PSendSysMessage("SKIP bag-slot-check: the Main Vault has no metadata row yet, "
+                "which is expected until this character buys or opens a vault.");
+        }
+        else
+        {
+            uint8 const storedSlots = sExtendedBankMgr->GetVaultBagSlots(guid, active);
+            if (storedSlots != player->GetBankBagSlotCount())
+            {
+                handler->PSendSysMessage("FAIL bag-slot-mismatch: vault {} stores {}, live is {}",
+                    active, storedSlots, player->GetBankBagSlotCount());
+                ++failures;
+            }
         }
 
         if (!failures)
@@ -304,8 +329,7 @@ namespace
     // new vault name instead.
     bool HandleVaultRenameCommand(ChatHandler* handler, PlayerIdentifier target, uint8 vault, Tail name)
     {
-        Optional<PlayerIdentifier> const wrapped = target;
-        Player* player = ResolveTarget(handler, wrapped);
+        Player* player = ResolveTarget(handler, target);
         if (!player)
             return true;
 

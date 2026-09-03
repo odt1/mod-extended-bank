@@ -154,6 +154,12 @@ struct ExtendedBankLayoutDelta
 struct ExtendedBankDebugState
 {
     bool HasSession{ false };
+
+    // Whether the active vault has a `mod_extended_bank_vaults` row at all. A character who
+    // has never bought or opened a vault has none, and the bag slot count read back for them
+    // is 0 rather than whatever they have actually paid for.
+    bool HasVaultRow{ false };
+
     uint8 ActiveVault{ EXTENDED_BANK_DEFAULT_VAULT };
     ObjectGuid BankerGuid;
     std::size_t PersistedItems{ 0 };
@@ -213,18 +219,28 @@ public:
     void RenameVault(Player* player, uint8 vault, std::string const& name);
 
 private:
-    void SwitchTo(Player* player, uint8 target);
-    void PersistOutgoingVault(Player* player, uint8 vault);
-    void SelfHealVaultRows(ObjectGuid::LowType lowGuid);
-
-    // Writes the live bank bag slot count into a vault's row when it has changed. Buying a
-    // slot only calls Player::SetBankBagSlotCount, so without this the purchase is lost the
-    // moment the player switches away from the vault they bought it on.
-    void SyncVaultBagSlots(Player* player, uint8 vault);
+    /* -- vault metadata, in ExtendedBankVaults.cpp ------------------------ */
 
     // Refills only the vault metadata list. Unlike LoadPlayer it leaves the session and the
     // live bank alone, so it is safe to call while a vault is open.
     void LoadVaultList(ObjectGuid playerGuid);
+    void SelfHealVaultRows(ObjectGuid::LowType lowGuid);
+    void EnsureDefaultVaultRow(Player* player);
+
+    // Writes the live bank bag slot count into a vault's row when it has changed. Buying a
+    // slot only calls Player::SetBankBagSlotCount, so without this the purchase is lost the
+    // moment the player switches away from the vault they bought it on. Given a transaction
+    // the write joins it; given none it goes out on its own.
+    void SyncVaultBagSlots(Player* player, uint8 vault, CharacterDatabaseTransaction trans = nullptr);
+
+    [[nodiscard]] ExtendedBankVault* FindVault(ObjectGuid playerGuid, uint8 vault);
+    [[nodiscard]] ExtendedBankVault const* FindVault(ObjectGuid playerGuid, uint8 vault) const;
+
+    /* -- the live bank, in ExtendedBankStorage.cpp ------------------------- */
+
+    void SwitchTo(Player* player, uint8 target);
+    void PersistOutgoingVault(Player* player, uint8 vault);
+
     void CaptureLayout(ExtendedBankSession& session, std::vector<ExtendedBankItemPos> const& items,
         uint8 bagSlots) const;
 
@@ -233,7 +249,7 @@ private:
     // the nested form ran into five figures of comparisons on every packet the player sent.
     [[nodiscard]] ExtendedBankLayoutDelta ComputeLayoutDelta(ExtendedBankSession const& session,
         std::vector<ExtendedBankItemPos> const& items, uint8 bagSlots) const;
-    [[nodiscard]] bool AnyItemQueued(std::vector<ExtendedBankItemPos> const& items) const;
+    [[nodiscard]] static bool AnyItemQueued(std::vector<ExtendedBankItemPos> const& items);
 
     // Moves items the game caps per character out of a module-owned vault and back into the
     // player's bags. Returns true if anything was moved, in which case the caller must
@@ -241,7 +257,6 @@ private:
     bool EvictRestrictedItems(Player* player, std::vector<ExtendedBankItemPos> const& items,
         CharacterDatabaseTransaction trans, ObjectGuid bankerGuid);
 
-    void SyncSessionCount() { _activeSessionCount.store(_sessions.size()); }
     void PersistVaultLayout(Player* player, uint8 vault, std::vector<ExtendedBankItemPos> const& items,
         ExtendedBankLayoutDelta const& delta, CharacterDatabaseTransaction trans);
 
@@ -253,10 +268,30 @@ private:
     void DetachLiveBank(Player* player, std::vector<ExtendedBankItemPos> const& items);
     void AttachVault(Player* player, uint8 vault);
     void RestoreItemSideData(Player* player, Item* item, CharacterDatabaseTransaction trans);
-    void EnsureDefaultVaultRow(Player* player);
 
-    [[nodiscard]] ExtendedBankVault* FindVault(ObjectGuid playerGuid, uint8 vault);
-    [[nodiscard]] ExtendedBankVault const* FindVault(ObjectGuid playerGuid, uint8 vault) const;
+    // Reads a vault's contents in the 15-column shape Item::LoadFromDB expects, whichever
+    // table owns that vault.
+    [[nodiscard]] QueryResult QueryVaultContents(ObjectGuid::LowType lowGuid, uint8 vault) const;
+
+    /* -- item plumbing, in ExtendedBankStorage.cpp ------------------------- */
+
+    // Takes an item out of everything the player tracks it through, short of freeing it: the
+    // update queue, the refund set, the soulbound-trade list, and the client's view of the
+    // world. Whether the Item is then deleted or handed to a MailDraft is the caller's
+    // business. Safe on an item that never reached a slot, which is the case AttachVault
+    // needs -- Player::RemoveItem covers only the trade list, and only for an item that was
+    // in a slot to be removed from.
+    static void ReleaseItem(Player* player, Item* item);
+
+    // Un-queues an item and marks it clean, exactly as Player::_LoadInventory does after
+    // storing one, so nothing the module places can reach character_inventory.
+    static void MarkClean(Player* player, Item* item);
+
+    // Hands items back by mail, MAX_MAIL_ITEMS to a letter, in the caller's transaction.
+    static void MailItemsBack(Player* player, std::vector<Item*>& items,
+        CharacterDatabaseTransaction trans, char const* subject, char const* body);
+
+    void SyncSessionCount() { _activeSessionCount.store(_sessions.size()); }
 
     // Player::Update, and therefore OnPlayerUpdate, runs on the MapUpdater worker pool, so
     // two players on different maps reach these containers concurrently whenever

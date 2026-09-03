@@ -146,7 +146,14 @@ The section that matters most.
 ## 4. Bank bag slots
 
 - [x] Buy a bank bag slot with vault 2 open: the price follows `BankBagSlotPrices.dbc` for
-      **vault 2's** count, not vault 1's.
+      **vault 2's** count, not vault 1's. The shipped prices, checked against the DBC, are
+      10s, 1g, 10g, 25g, 25g, 25g, 25g for slots 1..7 — 111g 10s for a full set, so a vault
+      whose count is behind vault 1's is visibly cheaper to top up.
+- [x] An eighth slot is refused. Observed in game as a "can't buy more" refusal, and the cap is
+      the client's own: `PurchaseSlot()` builds `CMSG_BUY_BANK_SLOT` only while the bank bag
+      slot byte is `< 7`, so nothing reaches the server. Worth knowing because the DBC *does*
+      carry rows 8..12 and the core handler would sell them — the seven-slot bound is the
+      client's, not the price table's, and a forged packet is the only way past it.
 - [x] Switch to vault 1: its count is unchanged and all its bags are present. *A wrong count here
       makes the core mail vault 1's bank bags back — grep the log for `sent by mail`.*
 - [x] Relog: both counts restored.
@@ -373,6 +380,49 @@ Two genuine exceptions were found by that sweep and are listed separately: the t
 - [ ] A rename for a vault you do not own.
 - [ ] `CMSG_BANKER_ACTIVATE` for a creature that is not a banker, and for one out of range.
 - [x] Vault switches spammed as fast as the client will send them.
+
+## Regression pass after the 2026-09-03 refactor
+
+`ExtendedBankStorage.cpp` was split, four helpers were extracted, and four behaviours changed on
+purpose. **Re-run `cmake .` in `build/` before rebuilding** — `ExtendedBankVaults.cpp` is a new
+source file and `CollectSourceFiles()` is a configure-time glob, so without it the link fails on
+an unresolved `ExtendedBankMgr::instance`.
+
+Everything else is meant to be behaviour-identical, so the quickest confidence check is §3 and
+§4 end to end. The four deliberate changes, each cheap to confirm:
+
+- [ ] `.vault check` on a character who has never bought or opened a vault prints
+      `SKIP bag-slot-check` instead of a spurious `FAIL bag-slot-mismatch`. It was comparing a
+      purchased bank bag slot count against the 0 returned for a vault with no metadata row.
+      The skip is narrow: a *non-default* vault open with no row is now its own failure,
+      `FAIL missing-vault-row`, because that is the state that stops `LoadPlayer` restoring
+      `PLAYER_BYTES_2` and gets the vault's bank bags mailed back.
+- [ ] Re-opening a vault that is *already* open, from a **different** banker, rebinds the
+      banker and restarts the range-check interval. Walk between two bankers without switching
+      vaults; the vault must stay loaded. Re-opening from the *same* banker deliberately leaves
+      the timer alone, so a client repeating the packet cannot hold the range check off.
+- [ ] The rename list holds one menu slot back for **Back**. Unreachable at a vault limit of 20;
+      confirm the menu still looks the same.
+- [ ] `IsVaultRestricted` is now the exact negation of `Player::CanTakeMoreSimilarItems`'s "no
+      maximum" test, which treats `MaxCount == 2147483647` as unlimited even when the item also
+      carries an `ItemLimitCategory`. Both forms select the same 5802 shipped templates, so §10
+      should behave identically; only a custom item could tell them apart.
+- [ ] **The eviction notice names the item that actually moved.** A capped *bag* drags its
+      uncapped contents out of the vault with it. If the bag fits back into the player's bags
+      while a loose item from inside it does not, the whisper used to name the bag as having
+      been mailed -- it tracked one name plus a ''did anything mail'' counter, and the counter
+      was set by the loose item. It now tracks the first mailed item separately and prefers it,
+      since that is the one the player cannot see arrive. Same unreachable-from-a-client
+      caveat as the restricted-bag entry in §10.
+- [ ] **Refund and soulbound-trade registrations on a mailed-back item.** `AttachVault` runs
+      `RestoreItemSideData` *before* trying to place an item, so an item that then fails to
+      place was registered in `m_refundableItems` and/or `m_itemSoulboundTradeable` and was
+      being mailed with both entries intact — `Player::RemoveItem`, which clears the trade
+      list, never runs on that path. `ReleaseItem` now clears both and is called there. Needs
+      a vault holding a refundable or BOP-tradeable item that cannot be placed, so it is an
+      instrumented-build test rather than a client one; listed because the failure is silent
+      (a `_SaveInventory` complaint per save, and a once-a-second walk over an item that now
+      lives in the mail).
 
 ## What is left
 

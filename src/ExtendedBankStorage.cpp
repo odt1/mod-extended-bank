@@ -5,6 +5,15 @@
  * AzerothCore. See LICENSE in the root of this repository.
  */
 
+/*
+ * The live bank: attaching a vault into the player's real bank slots, detaching it again, and
+ * every write that decides which table an item belongs to.
+ *
+ * The invariant the whole module serves lives in this file. Vault 1 IS `character_inventory`;
+ * vaults 2..N are `mod_extended_bank_vault_items`; nothing ever moves between the two tables.
+ * ExtendedBankVaults.cpp holds the metadata table and the queries, none of which touch an item.
+ */
+
 #include "ExtendedBank.h"
 #include "Bag.h"
 #include "Chat.h"
@@ -19,14 +28,18 @@
 #include "StringConvert.h"
 #include "StringFormat.h"
 #include "Tokenize.h"
-#include "Util.h"
 #include "WorldSession.h"
-#include <algorithm>
 #include <map>
 #include <set>
 #include <string>
 #include <unordered_map>
-#include <utility>
+#include <vector>
+
+ExtendedBankMgr* ExtendedBankMgr::instance()
+{
+    static ExtendedBankMgr instance;
+    return &instance;
+}
 
 namespace
 {
@@ -38,227 +51,55 @@ namespace
         "ii.enchantments, ii.randomPropertyId, ii.durability, ii.playedTime, ii.text";
 }
 
-ExtendedBankMgr* ExtendedBankMgr::instance()
-{
-    static ExtendedBankMgr instance;
-    return &instance;
-}
-
 /* ------------------------------------------------------------------------ */
-/* Lifecycle                                                                 */
+/* Item plumbing shared by attach, detach and eviction                       */
 /* ------------------------------------------------------------------------ */
 
-void ExtendedBankMgr::LoadVaultList(ObjectGuid playerGuid)
+void ExtendedBankMgr::ReleaseItem(Player* player, Item* item)
 {
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
+    item->RemoveFromUpdateQueueOf(player);
 
-    _vaults.erase(playerGuid);
+    // Both are erase-if-present, so calling this after Player::RemoveItem -- which does
+    // RemoveTradeableItem itself, but not DeleteRefundReference -- costs nothing. Doing both
+    // is what makes the call safe on an item that never reached a slot: AttachVault runs
+    // RestoreItemSideData *before* the placement attempt, so an item that then fails to place
+    // is already registered in one or both. Left behind, the refund GUID makes _SaveInventory
+    // complain every save, and the trade-list pointer is walked once a second by
+    // Player::UpdateSoulboundTradeItems for an item that by then lives in the mail.
+    player->DeleteRefundReference(item->GetGUID());
+    player->RemoveTradeableItem(item);
 
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT vault, name, bag_slots FROM mod_extended_bank_vaults WHERE owner_guid = {} ORDER BY vault",
-        playerGuid.GetCounter());
-
-    if (!result)
-        return;
-
-    std::vector<ExtendedBankVault>& vaults = _vaults[playerGuid];
-
-    do
+    if (item->IsInWorld())
     {
-        Field* fields = result->Fetch();
-
-        ExtendedBankVault vault;
-        vault.Vault = fields[0].Get<uint8>();
-        vault.Name = fields[1].Get<std::string>();
-        vault.BagSlots = fields[2].Get<uint8>();
-
-        vaults.push_back(std::move(vault));
-    } while (result->NextRow());
-}
-
-void ExtendedBankMgr::LoadPlayer(Player* player)
-{
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-
-    ObjectGuid const playerGuid = player->GetGUID();
-
-    _sessions.erase(playerGuid);
-    SyncSessionCount();
-
-    LoadVaultList(playerGuid);
-
-    // Login is the only moment at which no write of this module's can still be in flight, so
-    // it is the only moment at which reading character_inventory to repair vault rows is
-    // safe. Reads take a synchronous connection while writes are committed on the async
-    // worker pool, so running this check mid-session could see a row whose deletion has been
-    // queued but not executed, and delete a perfectly good vault row because of it.
-    //
-    // Gated on the list loaded just above: only a character who owns a vault beyond the
-    // default one can have rows in the item table at all, so on a realm where most characters
-    // never buy a vault this synchronous query disappears from the login path entirely
-    // instead of running once per login for everyone.
-    if (GetHighestOwnedVault(playerGuid) != EXTENDED_BANK_DEFAULT_VAULT)
-        SelfHealVaultRows(playerGuid.GetCounter());
-
-    // The live bank always holds the default vault here: character_inventory has not been
-    // read yet and it is the only thing Player::_LoadInventory will restore. PLAYER_BYTES_2,
-    // however, may still carry the bag slot count of whatever vault was open when the server
-    // died. Left alone, _LoadInventory would refuse the default vault's bank bags and mail
-    // them back to the owner.
-    if (ExtendedBankVault const* meta = FindVault(playerGuid, EXTENDED_BANK_DEFAULT_VAULT))
-    {
-        if (player->GetBankBagSlotCount() != meta->BagSlots)
-        {
-            LOG_INFO("module.extendedbank", "Restoring bank bag slot count {} (was {}) for player {}.",
-                meta->BagSlots, player->GetBankBagSlotCount(), playerGuid.ToString());
-            player->SetBankBagSlotCount(meta->BagSlots);
-        }
+        item->RemoveFromWorld();
+        item->DestroyForPlayer(player);
     }
 }
 
-void ExtendedBankMgr::ForgetPlayer(ObjectGuid playerGuid)
+void ExtendedBankMgr::MarkClean(Player* player, Item* item)
 {
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-
-    _vaults.erase(playerGuid);
-    _sessions.erase(playerGuid);
-    SyncSessionCount();
+    item->RemoveFromUpdateQueueOf(player);
+    item->SetState(ITEM_UNCHANGED);
 }
 
-void ExtendedBankMgr::SelfHealVaultRows(ObjectGuid::LowType lowGuid)
+void ExtendedBankMgr::MailItemsBack(Player* player, std::vector<Item*>& items,
+    CharacterDatabaseTransaction trans, char const* subject, char const* body)
 {
-    // An unclean shutdown can leave an item listed in a vault while it has since gone somewhere
-    // the core owns. Anywhere else always wins: a vault row is only a position, whereas every
-    // table below is the item genuinely being somewhere, and leaving the row would let
-    // AttachVault load a second copy of an item that still has its item_instance row.
-    //
-    // character_inventory is the case this was written for. The other three come from handlers
-    // that resolve items by GUID -- Player::GetItemByGuid scans bank slots and bank bags
-    // (PlayerStorage.cpp:423,435), so CMSG_SEND_MAIL and CMSG_AUCTION_SELL_ITEM can take an
-    // item straight out of a live vault. The stock client cannot do it, since its mail and
-    // auction frames only accept items dragged from the bags, but a forged packet can. The
-    // drain that follows within a tick removes the vault row correctly; this covers a crash
-    // inside that tick.
-    //
-    // Every joined column is indexed (mail_items and auctionhouse on the item, guild_bank_item
-    // by Idx_item_guid), so this stays an index lookup per vault row.
-    CharacterDatabase.DirectExecute(
-        "DELETE v FROM mod_extended_bank_vault_items v "
-        "LEFT JOIN character_inventory ci ON ci.item = v.item "
-        "LEFT JOIN mail_items mi ON mi.item_guid = v.item "
-        "LEFT JOIN auctionhouse ah ON ah.itemguid = v.item "
-        "LEFT JOIN guild_bank_item gbi ON gbi.item_guid = v.item "
-        "WHERE v.owner_guid = {} AND (ci.item IS NOT NULL OR mi.item_guid IS NOT NULL "
-        "OR ah.itemguid IS NOT NULL OR gbi.item_guid IS NOT NULL)", lowGuid);
-}
+    // MAX_MAIL_ITEMS is 12 and a full vault holds up to 280, so this has to be able to send
+    // more than one letter. Always mailed in the caller's transaction, never one of its own:
+    // the same commit has to carry whatever row change took these items out of the bank, or a
+    // crash between the two commits leaves an item in mail_items and in a vault at once.
+    for (std::size_t sent = 0; sent < items.size(); )
+    {
+        MailDraft draft(subject, body);
 
-void ExtendedBankMgr::DeleteCharacterData(CharacterDatabaseTransaction trans, ObjectGuid::LowType lowGuid)
-{
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
+        for (uint8 i = 0; sent < items.size() && i < MAX_MAIL_ITEMS; ++i, ++sent)
+            draft.AddItem(items[sent]);
 
-    // Player::DeleteFromDB already drops every item_instance row owned by this character,
-    // so only the module's own bookkeeping needs clearing here.
-    trans->Append("DELETE FROM mod_extended_bank_vault_items WHERE owner_guid = {}", lowGuid);
-    trans->Append("DELETE FROM mod_extended_bank_vaults WHERE owner_guid = {}", lowGuid);
-}
+        draft.SendMailTo(trans, player, MailSender(player, MAIL_STATIONERY_GM), MAIL_CHECK_MASK_COPIED);
+    }
 
-/* ------------------------------------------------------------------------ */
-/* Queries                                                                   */
-/* ------------------------------------------------------------------------ */
-
-std::vector<uint8> ExtendedBankMgr::GetOwnedVaults(ObjectGuid playerGuid) const
-{
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-
-    std::vector<uint8> owned{ EXTENDED_BANK_DEFAULT_VAULT };
-
-    auto const itr = _vaults.find(playerGuid);
-    if (itr != _vaults.end())
-        for (ExtendedBankVault const& entry : itr->second)
-            if (entry.Vault != EXTENDED_BANK_DEFAULT_VAULT)
-                owned.push_back(entry.Vault);
-
-    std::sort(owned.begin(), owned.end());
-    return owned;
-}
-
-uint8 ExtendedBankMgr::GetHighestOwnedVault(ObjectGuid playerGuid) const
-{
-    return GetOwnedVaults(playerGuid).back();
-}
-
-bool ExtendedBankMgr::OwnsVault(ObjectGuid playerGuid, uint8 vault) const
-{
-    if (vault == EXTENDED_BANK_DEFAULT_VAULT)
-        return true;
-
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-    return FindVault(playerGuid, vault) != nullptr;
-}
-
-uint8 ExtendedBankMgr::GetActiveVault(ObjectGuid playerGuid) const
-{
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-
-    auto const itr = _sessions.find(playerGuid);
-    return itr != _sessions.end() ? itr->second.ActiveVault : EXTENDED_BANK_DEFAULT_VAULT;
-}
-
-std::string ExtendedBankMgr::GetVaultName(ObjectGuid playerGuid, uint8 vault) const
-{
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-
-    if (ExtendedBankVault const* entry = FindVault(playerGuid, vault))
-        if (!entry->Name.empty())
-            return entry->Name;
-
-    return vault == EXTENDED_BANK_DEFAULT_VAULT
-        ? std::string("Main Vault")
-        : Acore::StringFormat("Vault {}", vault);
-}
-
-uint8 ExtendedBankMgr::GetVaultBagSlots(ObjectGuid playerGuid, uint8 vault) const
-{
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-
-    ExtendedBankVault const* entry = FindVault(playerGuid, vault);
-    return entry ? entry->BagSlots : 0;
-}
-
-ExtendedBankDebugState ExtendedBankMgr::GetDebugState(ObjectGuid playerGuid) const
-{
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-
-    ExtendedBankDebugState state;
-
-    auto const itr = _sessions.find(playerGuid);
-    if (itr == _sessions.end())
-        return state;
-
-    state.HasSession = true;
-    state.ActiveVault = itr->second.ActiveVault;
-    state.BankerGuid = itr->second.BankerGuid;
-    state.PersistedItems = itr->second.PersistedLayout.size();
-    state.PersistedBagSlots = itr->second.PersistedBagSlots;
-    return state;
-}
-
-ExtendedBankVault* ExtendedBankMgr::FindVault(ObjectGuid playerGuid, uint8 vault)
-{
-    return const_cast<ExtendedBankVault*>(std::as_const(*this).FindVault(playerGuid, vault));
-}
-
-ExtendedBankVault const* ExtendedBankMgr::FindVault(ObjectGuid playerGuid, uint8 vault) const
-{
-    auto const itr = _vaults.find(playerGuid);
-    if (itr == _vaults.end())
-        return nullptr;
-
-    for (ExtendedBankVault const& entry : itr->second)
-        if (entry.Vault == vault)
-            return &entry;
-
-    return nullptr;
+    items.clear();
 }
 
 /* ------------------------------------------------------------------------ */
@@ -354,7 +195,7 @@ void ExtendedBankMgr::PersistVaultLayout(Player* player, uint8 vault,
 
                 values += Acore::StringFormat("({},{},{},{},{})",
                     items[index].ItemPtr->GetGUID().GetCounter(), lowGuid, vault,
-                    items[index].Bag, uint32(items[index].Slot));
+                    items[index].Bag, items[index].Slot);
             }
 
             trans->Append("INSERT INTO mod_extended_bank_vault_items (item, owner_guid, vault, bag, slot) "
@@ -382,16 +223,9 @@ void ExtendedBankMgr::PersistVaultLayout(Player* player, uint8 vault,
         pos.ItemPtr->SaveToDB(trans);
     }
 
-    if (ExtendedBankVault* meta = FindVault(player->GetGUID(), vault))
-    {
-        uint8 const liveCount = player->GetBankBagSlotCount();
-        if (meta->BagSlots != liveCount)
-        {
-            meta->BagSlots = liveCount;
-            trans->Append("UPDATE mod_extended_bank_vaults SET bag_slots = {} WHERE owner_guid = {} AND vault = {}",
-                liveCount, lowGuid, vault);
-        }
-    }
+    // In this transaction, not on its own: a bag slot bought moments ago and the rows of the
+    // bag that went into it have to become true together.
+    SyncVaultBagSlots(player, vault, trans);
 }
 
 void ExtendedBankMgr::CaptureLayout(ExtendedBankSession& session,
@@ -446,7 +280,7 @@ ExtendedBankLayoutDelta ExtendedBankMgr::ComputeLayoutDelta(ExtendedBankSession 
     return delta;
 }
 
-bool ExtendedBankMgr::AnyItemQueued(std::vector<ExtendedBankItemPos> const& items) const
+bool ExtendedBankMgr::AnyItemQueued(std::vector<ExtendedBankItemPos> const& items)
 {
     for (ExtendedBankItemPos const& pos : items)
         if (pos.ItemPtr->IsInUpdateQueue() || pos.ItemPtr->GetState() != ITEM_UNCHANGED)
@@ -470,14 +304,7 @@ void ExtendedBankMgr::DetachLiveBank(Player* player, std::vector<ExtendedBankIte
         // block for an item that is about to be destroyed on the very next line. The slot
         // GUIDs it clears are still pushed, as one batch, by OpenVault's SendUpdateToPlayer.
         player->RemoveItem(item->GetBagSlot(), item->GetSlot(), false);
-        item->RemoveFromUpdateQueueOf(player);
-        player->DeleteRefundReference(item->GetGUID());
-
-        if (item->IsInWorld())
-        {
-            item->RemoveFromWorld();
-            item->DestroyForPlayer(player);
-        }
+        ReleaseItem(player, item);
 
         delete item;
     }
@@ -550,16 +377,13 @@ void ExtendedBankMgr::RestoreItemSideData(Player* player, Item* item, CharacterD
 /* Attaching a vault to the live bank slots                                  */
 /* ------------------------------------------------------------------------ */
 
-void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
+QueryResult ExtendedBankMgr::QueryVaultContents(ObjectGuid::LowType lowGuid, uint8 vault) const
 {
-    ObjectGuid::LowType const lowGuid = player->GetGUID().GetCounter();
-    QueryResult result;
-
     if (vault == EXTENDED_BANK_DEFAULT_VAULT)
     {
         // The default vault is simply the bank half of character_inventory: the top level
         // bank slots, plus everything sitting inside a bag that occupies a bank bag slot.
-        result = CharacterDatabase.Query(
+        return CharacterDatabase.Query(
             "SELECT {}, ci.bag, ci.slot, ci.item, ii.itemEntry "
             "FROM character_inventory ci "
             "JOIN item_instance ii ON ci.item = ii.guid "
@@ -572,31 +396,43 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
             uint32(BANK_SLOT_ITEM_START), uint32(BANK_SLOT_BAG_END),
             uint32(BANK_SLOT_BAG_START), uint32(BANK_SLOT_BAG_END));
     }
-    else
+
+    // No self-heal here: it reads character_inventory on a synchronous connection while this
+    // module's deletes of those same rows are committed asynchronously, so mid-session it can
+    // see a row whose deletion is still queued and destroy a valid vault row.
+    // SelfHealVaultRows runs once per login instead, where nothing is in flight.
+    return CharacterDatabase.Query(
+        "SELECT {}, v.bag, v.slot, v.item, ii.itemEntry "
+        "FROM mod_extended_bank_vault_items v "
+        "JOIN item_instance ii ON v.item = ii.guid "
+        "WHERE v.owner_guid = {} AND v.vault = {} "
+        "ORDER BY v.bag, v.slot",
+        ITEM_INSTANCE_COLUMNS, lowGuid, vault);
+}
+
+void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
+{
+    ObjectGuid const playerGuid = player->GetGUID();
+
+    // Records what is now live so the first flush of this vault can tell that nothing moved,
+    // and pins the session's idea of which vault it holds before anything else can read it.
+    auto const openSession = [&](std::vector<ExtendedBankItemPos> const& attached)
     {
-        // No self-heal here: it reads character_inventory on a synchronous connection while
-        // this module's deletes of those same rows are committed asynchronously, so mid-session
-        // it can see a row whose deletion is still queued and destroy a valid vault row.
-        // SelfHealVaultRows runs once per login instead, where nothing is in flight.
-        result = CharacterDatabase.Query(
-            "SELECT {}, v.bag, v.slot, v.item, ii.itemEntry "
-            "FROM mod_extended_bank_vault_items v "
-            "JOIN item_instance ii ON v.item = ii.guid "
-            "WHERE v.owner_guid = {} AND v.vault = {} "
-            "ORDER BY v.bag, v.slot",
-            ITEM_INSTANCE_COLUMNS, lowGuid, vault);
-    }
+        if (vault == EXTENDED_BANK_DEFAULT_VAULT)
+            return;
+
+        ExtendedBankSession& session = _sessions[playerGuid];
+        session.ActiveVault = vault;
+        CaptureLayout(session, attached, player->GetBankBagSlotCount());
+        SyncSessionCount();
+    };
+
+    QueryResult result = QueryVaultContents(playerGuid.GetCounter(), vault);
 
     if (!result)
     {
         // An empty vault is still a known state; record it so the first flush can skip.
-        if (vault != EXTENDED_BANK_DEFAULT_VAULT)
-        {
-            ExtendedBankSession& session = _sessions[player->GetGUID()];
-            CaptureLayout(session, {}, player->GetBankBagSlotCount());
-            SyncSessionCount();
-        }
-
+        openSession({});
         return;
     }
 
@@ -630,17 +466,17 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
             // Same treatment Player::_LoadItem gives an unknown entry: drop the position row
             // and the item_instance row, so the error is not repeated on every future open.
             LOG_ERROR("module.extendedbank", "Player {} has unknown item entry {} in vault {}, removing.",
-                player->GetGUID().ToString(), itemEntry, vault);
+                playerGuid.ToString(), itemEntry, vault);
             dropRow(itemGuid);
             Item::DeleteFromDB(trans, itemGuid);
             continue;
         }
 
         Item* item = NewItemOrBag(proto);
-        if (!item->LoadFromDB(itemGuid, player->GetGUID(), fields, itemEntry))
+        if (!item->LoadFromDB(itemGuid, playerGuid, fields, itemEntry))
         {
             LOG_ERROR("module.extendedbank", "Player {} has a broken item (entry {}) in vault {}, removing.",
-                player->GetGUID().ToString(), itemEntry, vault);
+                playerGuid.ToString(), itemEntry, vault);
             dropRow(itemGuid);
 
             // Item::SaveToDB deletes the object itself on ITEM_REMOVED (Item.cpp:407), so
@@ -667,7 +503,7 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
                 if (!item)
                 {
                     LOG_ERROR("module.extendedbank", "Player {} lost item {} while attaching vault {}.",
-                        player->GetGUID().ToString(), itemGuid, vault);
+                        playerGuid.ToString(), itemGuid, vault);
                     continue;
                 }
             }
@@ -694,10 +530,11 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
                 {
                     LOG_ERROR("module.extendedbank",
                         "Player {} has item {} in vault {} referencing unknown bag {}; mailing it back.",
-                        player->GetGUID().ToString(), itemGuid, vault, bagGuid);
+                        playerGuid.ToString(), itemGuid, vault, bagGuid);
                 }
 
                 dropRow(itemGuid);
+                ReleaseItem(player, item);
                 problematicItems.push_back(item);
                 continue;
             }
@@ -710,7 +547,7 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
                 if (!item)
                 {
                     LOG_ERROR("module.extendedbank", "Player {} lost item {} while attaching vault {}.",
-                        player->GetGUID().ToString(), itemGuid, vault);
+                        playerGuid.ToString(), itemGuid, vault);
                     continue;
                 }
             }
@@ -718,34 +555,24 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
 
         if (err == EQUIP_ERR_OK)
         {
-            // Cancel the ITEM_CHANGED that StoreItem just queued, the same way
+            // Cancels the ITEM_CHANGED that storing just queued, the same way
             // Player::_LoadInventory does, so nothing ever reaches character_inventory.
-            item->RemoveFromUpdateQueueOf(player);
-            item->SetState(ITEM_UNCHANGED);
+            MarkClean(player, item);
         }
         else
         {
             LOG_ERROR("module.extendedbank",
                 "Player {} could not be given item {} from vault {} (reason {}); mailing it back.",
-                player->GetGUID().ToString(), itemGuid, vault, uint32(err));
+                playerGuid.ToString(), itemGuid, vault, uint32(err));
 
             dropRow(itemGuid);
+            ReleaseItem(player, item);
             problematicItems.push_back(item);
         }
     } while (result->NextRow());
 
-    while (!problematicItems.empty())
-    {
-        MailDraft draft("Bank vault", "Some items could not be placed back into your bank.");
-
-        for (uint8 i = 0; !problematicItems.empty() && i < MAX_MAIL_ITEMS; ++i)
-        {
-            draft.AddItem(problematicItems.front());
-            problematicItems.erase(problematicItems.begin());
-        }
-
-        draft.SendMailTo(trans, player, MailSender(player, MAIL_STATIONERY_GM), MAIL_CHECK_MASK_COPIED);
-    }
+    MailItemsBack(player, problematicItems, trans,
+        "Bank vault", "Some items could not be placed back into your bank.");
 
     // Un-queueing each item as it was stored is not enough on its own: Player::_StoreItem
     // marks the *containing bag* ITEM_CHANGED as well, so every bank bag is pushed back into
@@ -756,47 +583,24 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
     CollectLiveBankItems(player, attached);
 
     for (ExtendedBankItemPos const& pos : attached)
-    {
-        pos.ItemPtr->RemoveFromUpdateQueueOf(player);
-        pos.ItemPtr->SetState(ITEM_UNCHANGED);
-    }
+        MarkClean(player, pos.ItemPtr);
 
     CharacterDatabase.CommitTransaction(trans);
 
-    // Record what is now live so the first flush of this vault can tell that nothing moved.
-    if (vault != EXTENDED_BANK_DEFAULT_VAULT)
-    {
-        ExtendedBankSession& session = _sessions[player->GetGUID()];
-        CaptureLayout(session, attached, player->GetBankBagSlotCount());
-        SyncSessionCount();
-    }
+    openSession(attached);
 }
 
 /* ------------------------------------------------------------------------ */
 /* Switching                                                                 */
 /* ------------------------------------------------------------------------ */
 
-void ExtendedBankMgr::SyncVaultBagSlots(Player* player, uint8 vault)
-{
-    ExtendedBankVault* meta = FindVault(player->GetGUID(), vault);
-    if (!meta)
-        return;
-
-    uint8 const liveCount = player->GetBankBagSlotCount();
-    if (meta->BagSlots == liveCount)
-        return;
-
-    meta->BagSlots = liveCount;
-    CharacterDatabase.Execute(
-        "UPDATE mod_extended_bank_vaults SET bag_slots = {} WHERE owner_guid = {} AND vault = {}",
-        liveCount, player->GetGUID().GetCounter(), vault);
-}
-
 void ExtendedBankMgr::PersistOutgoingVault(Player* player, uint8 vault)
 {
     if (vault != EXTENDED_BANK_DEFAULT_VAULT)
     {
-        // The Item objects are about to be freed, so this is one of the two places the core's
+        // A non-default vault is live only through a session -- GetActiveVault reads nothing
+        // else -- so this lookup cannot miss for a vault the caller found active. The Item
+        // objects are about to be freed, which makes this one of the two places the core's
         // inventory save is both needed and safe.
         auto const itr = _sessions.find(player->GetGUID());
         if (itr != _sessions.end())
@@ -847,17 +651,19 @@ void ExtendedBankMgr::SwitchTo(Player* player, uint8 target)
     if (ExtendedBankVault const* meta = FindVault(playerGuid, target))
         player->SetBankBagSlotCount(meta->BagSlots);
 
+    // AttachVault opens the session for a non-default target and is the only writer of
+    // ActiveVault, so there is no state in which a vault is live behind a session that still
+    // claims the default one. Deliberately a lookup rather than operator[] here: creating a
+    // session at this point would be creating exactly that state.
     AttachVault(player, target);
 
     if (target == EXTENDED_BANK_DEFAULT_VAULT)
     {
         _sessions.erase(playerGuid);
     }
-    else
+    else if (auto const itr = _sessions.find(playerGuid); itr != _sessions.end())
     {
-        ExtendedBankSession& session = _sessions[playerGuid];
-        session.ActiveVault = target;
-        session.RangeCheckTimer = 0;
+        itr->second.RangeCheckTimer = 0;
     }
 
     SyncSessionCount();
@@ -893,7 +699,18 @@ bool ExtendedBankMgr::OpenVault(Player* player, uint8 target, ObjectGuid bankerG
 
     if (target != EXTENDED_BANK_DEFAULT_VAULT)
     {
-        _sessions[playerGuid].BankerGuid = bankerGuid;
+        ExtendedBankSession& session = _sessions[playerGuid];
+
+        // Rebinding to a different banker restarts the interval as well, so the player is not
+        // measured against one they have only just walked to. Re-opening from the *same*
+        // banker leaves the timer alone: resetting it there would let a client that repeats
+        // the packet faster than once a second hold the range check off indefinitely.
+        if (session.BankerGuid != bankerGuid)
+        {
+            session.BankerGuid = bankerGuid;
+            session.RangeCheckTimer = 0;
+        }
+
         SyncSessionCount();
     }
 
@@ -934,8 +751,9 @@ void ExtendedBankMgr::FlushAndDetachForLogout(Player* player)
     std::lock_guard<std::recursive_mutex> guard(_mutex);
 
     ObjectGuid const playerGuid = player->GetGUID();
+    uint8 const active = GetActiveVault(playerGuid);
 
-    if (GetActiveVault(playerGuid) == EXTENDED_BANK_DEFAULT_VAULT)
+    if (active == EXTENDED_BANK_DEFAULT_VAULT)
         return;
 
     // Reverting properly would reload the default vault's entire contents from
@@ -946,7 +764,7 @@ void ExtendedBankMgr::FlushAndDetachForLogout(Player* player)
     // mistaken for the default vault, and PLAYER_BYTES_2 carries the default vault's bag slot
     // count when the character is saved. character_inventory still holds the default vault's
     // rows untouched, so the next login restores it exactly as vanilla would.
-    PersistOutgoingVault(player, GetActiveVault(playerGuid));
+    PersistOutgoingVault(player, active);
 
     std::vector<ExtendedBankItemPos> live;
     CollectLiveBankItems(player, live);
@@ -959,21 +777,31 @@ void ExtendedBankMgr::FlushAndDetachForLogout(Player* player)
     SyncSessionCount();
 }
 
+/* ------------------------------------------------------------------------ */
+/* Flushing                                                                  */
+/* ------------------------------------------------------------------------ */
+
 namespace
 {
     // The game enforces these caps by counting what is in character_inventory, and a stowed
-    // vault is invisible to that count -- so a capped item parked in a vault lets its owner
-    // acquire another one. Mirrors Player::CanTakeMoreSimilarItems (PlayerStorage.cpp:818),
-    // including the 2147483647 sentinel that means "no limit" despite being positive.
+    // vault is invisible to that count -- so a capped item parked in a vault would let its
+    // owner acquire another one.
+    //
+    // Written as the exact negation of the "no maximum" test in
+    // Player::CanTakeMoreSimilarItems (PlayerStorage.cpp:818), sentinel and all: there,
+    // MaxCount == 2147483647 means "no limit" even for an item that also carries an
+    // ItemLimitCategory, so a predicate that read the two conditions independently would evict
+    // an item the game does not in fact cap. No shipped template sits in that corner -- both
+    // forms select the same 5802 rows -- but a custom one could.
     bool IsVaultRestricted(ItemTemplate const* proto)
     {
         if (!proto)
             return false;
 
-        if (proto->ItemLimitCategory != 0)
-            return true;
+        if (proto->MaxCount == 2147483647)
+            return false;
 
-        return proto->MaxCount > 0 && proto->MaxCount != 2147483647;
+        return proto->MaxCount > 0 || proto->ItemLimitCategory != 0;
     }
 }
 
@@ -1007,8 +835,15 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
 
     ChatHandler handler(player->GetSession());
     std::vector<Item*> mailed;
-    uint32 mailedCount = 0;
-    std::string firstName;
+
+    // Two names, not one, because the notice has to name an item that actually went where the
+    // notice says it went. A single name plus a "did anything mail" counter gets this wrong in
+    // one reachable combination: a capped *bag* drags its uncapped contents out with it, and if
+    // the bag fits back into the player's bags while a loose item from inside it does not, the
+    // counter is set by the loose item while the name comes from the bag -- so the whisper told
+    // the player their bag had been mailed while it was sitting in their bag panel.
+    std::string firstMailed;
+    std::string firstRejected;
 
     for (Item* item : rejected)
     {
@@ -1030,8 +865,8 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
             if (capped)
             {
                 handler.PSendSysMessage("Can't store {} in this vault, please use the Main one.", name);
-                if (firstName.empty())
-                    firstName = name;
+                if (firstRejected.empty())
+                    firstRejected = name;
             }
         }
         else
@@ -1042,45 +877,28 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
             // Player::_LoadInventory does exactly this before mailing (PlayerStorage.cpp:6058);
             // without it the item exists in mail_items and character_inventory at once.
             item->DeleteFromInventoryDB(trans);
-            item->RemoveFromUpdateQueueOf(player);
-            player->DeleteRefundReference(item->GetGUID());
-
-            if (item->IsInWorld())
-            {
-                item->RemoveFromWorld();
-                item->DestroyForPlayer(player);
-            }
+            ReleaseItem(player, item);
 
             mailed.push_back(item);
+
+            // Not gated on `capped`: an uncapped item only reaches this branch by having been
+            // inside a capped bag, and it is just as gone from the bank as the bag is.
+            if (firstMailed.empty())
+                firstMailed = name;
 
             if (capped)
             {
                 handler.PSendSysMessage("Can't store {} in this vault, please use the Main one. "
                     "Your bags are full, so it has been mailed to you.", name);
 
-                if (firstName.empty())
-                    firstName = name;
+                if (firstRejected.empty())
+                    firstRejected = name;
             }
-
-            ++mailedCount;
         }
     }
 
-    // Mailed in the caller's transaction, not one of our own: the same commit has to carry the
-    // vault-row rewrite that drops these items, or a crash between two commits leaves the item
-    // in mail_items and in mod_extended_bank_vault_items at the same time.
-    while (!mailed.empty())
-    {
-        MailDraft draft("Bank vault", "This item cannot be stored in that vault, please use the Main one.");
-
-        for (uint8 i = 0; !mailed.empty() && i < MAX_MAIL_ITEMS; ++i)
-        {
-            draft.AddItem(mailed.front());
-            mailed.erase(mailed.begin());
-        }
-
-        draft.SendMailTo(trans, player, MailSender(player, MAIL_STATIONERY_GM), MAIL_CHECK_MASK_COPIED);
-    }
+    MailItemsBack(player, mailed, trans,
+        "Bank vault", "This item cannot be stored in that vault, please use the Main one.");
 
     // A chat line is not enough. The item leaves the cursor and disappears from the bank in the
     // same instant, which reads as item loss, and nobody is watching the chat frame mid-drag.
@@ -1091,11 +909,16 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
     // A boss whisper is the whole mechanism. ChatHandler::SendNotification was tried alongside
     // it and removed: observed in a stock client the two render almost identically, the whisper
     // stays on screen longer, and the whisper is the one addons hook for an alert sound.
-    if (!firstName.empty())
+    // Anything mailed is named first and named as mailed, because that is the case a player
+    // cannot see the answer to. Only when nothing was mailed does the notice fall back to the
+    // capped item that went into the bags, which the player can watch arrive.
+    std::string const& subject = firstMailed.empty() ? firstRejected : firstMailed;
+
+    if (!subject.empty())
     {
-        std::string const notice = mailedCount
-            ? Acore::StringFormat("{} was sent to your mailbox - it cannot be stored in this vault.", firstName)
-            : Acore::StringFormat("{} cannot be stored in this vault - use the Main one.", firstName);
+        std::string const notice = firstMailed.empty()
+            ? Acore::StringFormat("{} cannot be stored in this vault - use the Main one.", subject)
+            : Acore::StringFormat("{} was sent to your mailbox - it cannot be stored in this vault.", subject);
 
         // Skipped when the banker GUID is the player's own, which is the GM .bank convention
         // and has no creature behind it -- then the chat line above is all there is.
@@ -1234,142 +1057,4 @@ void ExtendedBankMgr::UpdateRangeCheck(Player* player, uint32 diff)
     // the bank frame was closed, so losing the banker is the end-of-interaction signal.
     if (!player->GetNPCIfCanInteractWith(session.BankerGuid, UNIT_NPC_FLAG_BANKER))
         RevertToDefaultVault(player);
-}
-
-/* ------------------------------------------------------------------------ */
-/* Buying and renaming                                                       */
-/* ------------------------------------------------------------------------ */
-
-void ExtendedBankMgr::EnsureDefaultVaultRow(Player* player)
-{
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-
-    ObjectGuid const playerGuid = player->GetGUID();
-
-    if (FindVault(playerGuid, EXTENDED_BANK_DEFAULT_VAULT))
-        return;
-
-    ExtendedBankVault vault;
-    vault.Vault = EXTENDED_BANK_DEFAULT_VAULT;
-    vault.BagSlots = player->GetBankBagSlotCount();
-
-    CharacterDatabase.Execute(
-        "INSERT INTO mod_extended_bank_vaults (owner_guid, vault, name, bag_slots, created) "
-        "VALUES ({}, {}, '', {}, UNIX_TIMESTAMP()) "
-        "ON DUPLICATE KEY UPDATE bag_slots = VALUES(bag_slots)",
-        playerGuid.GetCounter(), uint32(EXTENDED_BANK_DEFAULT_VAULT), vault.BagSlots);
-
-    _vaults[playerGuid].push_back(std::move(vault));
-}
-
-bool ExtendedBankMgr::BuyNextVault(Player* player)
-{
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-
-    ObjectGuid const playerGuid = player->GetGUID();
-    ChatHandler handler(player->GetSession());
-
-    uint8 const next = GetHighestOwnedVault(playerGuid) + 1;
-
-    if (next > sExtendedBankConfig.GetMaxVaults())
-    {
-        handler.PSendSysMessage("You already own the maximum number of bank vaults ({}).",
-            sExtendedBankConfig.GetMaxVaults());
-        return false;
-    }
-
-    uint32 const cost = sExtendedBankConfig.GetVaultCost(next);
-    if (!player->HasEnoughMoney(cost))
-    {
-        handler.PSendSysMessage("You need {} gold to buy that vault.", cost / EXTENDED_BANK_COPPER_PER_GOLD);
-        return false;
-    }
-
-    // Charge only once the row is known not to exist. The in-memory list is normally
-    // authoritative, but it is rebuilt from the database at login and a desync would otherwise
-    // mean the player pays for a vault whose INSERT then fails on the primary key -- an async
-    // failure nothing surfaces. One indexed read on a rare action is worth that certainty.
-    if (QueryResult existing = CharacterDatabase.Query(
-        "SELECT 1 FROM mod_extended_bank_vaults WHERE owner_guid = {} AND vault = {}",
-        playerGuid.GetCounter(), next))
-    {
-        LOG_ERROR("module.extendedbank",
-            "Player {} tried to buy vault {}, which already exists in the database but not in memory. "
-            "Reloading their vaults; no money was taken.", playerGuid.ToString(), next);
-
-        // Only the metadata list: LoadPlayer would drop the session and reset the bank bag
-        // slot count, which would strand a vault that is open right now.
-        LoadVaultList(playerGuid);
-        handler.PSendSysMessage("Your vaults were out of date and have been reloaded. Please try again.");
-        return false;
-    }
-
-    EnsureDefaultVaultRow(player);
-    player->ModifyMoney(-int32(cost));
-
-    ExtendedBankVault vault;
-    vault.Vault = next;
-    vault.BagSlots = 0;
-
-    CharacterDatabase.Execute(
-        "INSERT INTO mod_extended_bank_vaults (owner_guid, vault, name, bag_slots, created) "
-        "VALUES ({}, {}, '', 0, UNIX_TIMESTAMP()) "
-        "ON DUPLICATE KEY UPDATE vault = VALUES(vault)",
-        playerGuid.GetCounter(), next);
-
-    _vaults[playerGuid].push_back(std::move(vault));
-
-    handler.PSendSysMessage("Vault {} purchased for {} gold.", next, cost / EXTENDED_BANK_COPPER_PER_GOLD);
-    return true;
-}
-
-void ExtendedBankMgr::RenameVault(Player* player, uint8 vault, std::string const& name)
-{
-    std::lock_guard<std::recursive_mutex> guard(_mutex);
-
-    ObjectGuid const playerGuid = player->GetGUID();
-
-    // The default vault is always owned but only gets a row once something writes one, so a
-    // character who has never bought or switched a vault has no row to rename -- and the
-    // Rename option is offered to them from the very first banker visit.
-    if (vault == EXTENDED_BANK_DEFAULT_VAULT)
-        EnsureDefaultVaultRow(player);
-
-    ExtendedBankVault* meta = FindVault(playerGuid, vault);
-    if (!meta)
-        return;
-
-    // Content is not filtered: colour codes and inline icons in a vault name are a feature.
-    // Length is, though. utf8truncate cuts on a character boundary rather than a byte one, so
-    // a multi-byte name can never be left with a split sequence, and it clears the string
-    // outright when the input is not valid UTF-8 -- both of which keep malformed text out of
-    // the client's gossip parser. An empty name falls back to "Vault N" in GetVaultName.
-    // The client doubles every '|' when it sends the contents of an edit box, so a player who
-    // types |cffff0000Herbs|r arrives here as ||cffff0000Herbs||r -- and '||' renders as a
-    // literal pipe, which is why colour codes and icons showed up as plain text. Collapsing
-    // the pairs back restores what the player actually typed. A literal '|' in a vault name
-    // is not reachable as a result, which is the same trade the game itself makes.
-    std::string stored;
-    stored.reserve(name.size());
-
-    for (std::size_t i = 0; i < name.size(); ++i)
-    {
-        stored.push_back(name[i]);
-        if (name[i] == '|' && i + 1 < name.size() && name[i + 1] == '|')
-            ++i;
-    }
-
-    utf8truncate(stored, EXTENDED_BANK_VAULT_NAME_MAX_CHARS);
-
-    std::string escaped = stored;
-    CharacterDatabase.EscapeString(escaped);
-
-    CharacterDatabase.Execute(
-        "UPDATE mod_extended_bank_vaults SET name = '{}' WHERE owner_guid = {} AND vault = {}",
-        escaped, playerGuid.GetCounter(), vault);
-
-    // Assign the same string that was written. Caching the untruncated name here is what
-    // turned an over-length rename into a broken gossip window that survived the failed
-    // UPDATE: the menu kept re-sending a name the database had rejected.
-    meta->Name = std::move(stored);
 }

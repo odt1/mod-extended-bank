@@ -267,7 +267,17 @@ vault open pays an atomic load and nothing else.
 
 Each vault has its own count of purchased bank bag slots. The stock purchase path is
 untouched: `WorldSession::HandleBuyBankSlotOpcode` reads the live count, prices the next slot
-from `BankBagSlotPrices.dbc` (10g, 100g, 250g, 600g, 1800g, 3800g, 9000g) and increments it.
+from `BankBagSlotPrices.dbc` and increments it. The shipped 3.3.5a prices are 10s, 1g, 10g,
+25g, 25g, 25g, 25g — 111g 10s for all seven.
+
+The DBC also carries rows 8..12, at 999,999,999 copper each. That is under `MAX_MONEY_AMOUNT`
+(2,147,483,646), so `HandleBuyBankSlotOpcode` — which checks nothing but the row existing and
+`HasEnoughMoney` — would sell them. It never gets the chance from a stock client: `PurchaseSlot()`
+gates on the bank bag slot byte being `< 7` and only then sends `CMSG_BUY_BANK_SLOT`, and
+`GetNumBankSlots()` reports `full` from the same byte with `count > 6`, so the UI hides the
+purchase frame and an eighth attempt is refused before any packet is built. Seven is a client
+constant, not a consequence of the price table. The module inherits that bound: `bag_slots` can
+only ever reach 7 through play.
 Because the live count is set to the open vault's count when that vault is opened, the in-bank
 "Purchase" button prices and scopes itself to that vault with no handler override at all.
 
@@ -362,13 +372,27 @@ contain the doubled form and need renaming once.
 
 A name is truncated to **240 characters** (`EXTENDED_BANK_VAULT_NAME_MAX_CHARS`).
 
-Nothing between the text box and the packet enforces a limit on its own: the client's gossip
-input box will send more than 255 characters, and `PlayerMenu::SendGossipMenu` writes the
-string straight into `SMSG_GOSSIP_MESSAGE` with no cap. The practical ceiling is what Blizzard
-shipped — across 3.3.5a's own `gossip_menu_option` data the longest `OptionText` is 397
-characters and the longest `BoxText` is 102, so a single gossip line of that order is known to
-render. 240 sits under that with room for the rename prompt, which embeds the name in
-`Enter a new name for {}:`, and under the `VARCHAR(255)` `name` column.
+Nothing between the text box and the packet enforces a limit on its own, in either direction.
+The client's rename box is `StaticPopupDialogs["GOSSIP_ENTER_CODE"]` in `StaticPopup.lua`, which
+declares no `maxLetters` at all — and `StaticPopup_Show` calls `editBox:SetMaxLetters` only when
+the dialog supplies one, so the box keeps whatever limit the last dialog to set one left behind.
+On the way in, `WorldSession::HandleGossipSelectOptionOpcode` reads the code string with no cap,
+and on the way out `PlayerMenu::SendGossipMenu` writes the option text straight into
+`SMSG_GOSSIP_MESSAGE` with no cap either. The module's own truncation is the only bound there
+is. The practical ceiling is what Blizzard shipped — across 3.3.5a's own `gossip_menu_option`
+data the longest `OptionText` is 397 characters and the longest `BoxText` is 102, so a single
+gossip line of that order is known to render. 240 sits under that with room for the rename
+prompt, which embeds the name in `Enter a new name for {}:`, and under the `VARCHAR(255)` `name`
+column.
+
+Truncation happens **before** escaping, and `TruncateAndQuote` exists to keep the two together.
+The order is a security property: the `UPDATE` is the module's only statement that interpolates
+a player-supplied string, and escaping first would let truncation bisect an escape pair and
+leave a trailing backslash that escapes the statement's own closing quote. Prepared statements
+are not available to a module — they live in the core's `CharacterDatabaseStatements` enum —
+so the escape is `mysql_real_escape_string` through the live connection handle, on a connection
+set to `utf8mb4`, which is what rules out the multi-byte lead-byte bypass. The format string is
+a literal, so the name is only ever an fmt *argument* and braces in it are inert.
 
 Truncation uses the core's `utf8truncate`, the same helper `Guild::BankTab::SetText` uses for
 guild bank tab text. It counts characters rather than bytes, so a multi-byte name is never
@@ -533,7 +557,7 @@ rows need clearing.
 - **Conditions on an NPC's banker option are honoured, by inheriting the core's answer.** The
   vault list stands in for the stock `GOSSIP_OPTION_BANKER` entry, so it is offered only where
   that entry is. `Player::PrepareGossipMenu` omits an option whose `conditions` row fails
-  (`PlayerGossip.cpp:58`) and applies no further check to a banker option, so one surviving into
+  (`PlayerGossip.cpp:60`) and applies no further check to a banker option, so one surviving into
   the built menu *is* the core's statement that this player may use this bank. When none does,
   the module returns false and the NPC is handed back untouched — the core re-runs
   `PrepareGossipMenu`, which is idempotent, and sends the menu through `SendPreparedGossip`,

@@ -9,14 +9,16 @@
 #include "Creature.h"
 #include "GossipDef.h"
 #include "Log.h"
+#include "Opcodes.h"
 #include "Player.h"
-#include "ScriptMgr.h"
 #include "ScriptedGossip.h"
+#include "ScriptMgr.h"
 #include "StringFormat.h"
 #include "TradeData.h"
-#include "Opcodes.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -49,10 +51,12 @@ namespace
     }
 
     // GossipMenu::AddMenuItem asserts past GOSSIP_MAX_MENU_ITEMS, and the client cannot
-    // render more than that either, so every add has to be able to refuse.
-    bool CanAddMenuItem(Player* player)
+    // render more than that either -- its own NUMGOSSIPBUTTONS is 32 as well -- so every add
+    // has to be able to refuse. `reserve` holds slots back for entries the menu is not usable
+    // without, such as the rename list's way out.
+    bool CanAddMenuItem(Player* player, uint32 reserve = 0)
     {
-        return player->PlayerTalkClass->GetGossipMenu().GetMenuItemCount() < GOSSIP_MAX_MENU_ITEMS;
+        return player->PlayerTalkClass->GetGossipMenu().GetMenuItemCount() + reserve < GOSSIP_MAX_MENU_ITEMS;
     }
 
     // Whether this module should take over an NPC's gossip.
@@ -68,10 +72,7 @@ namespace
             && creature->HasNpcFlag(UNIT_NPC_FLAG_BANKER)
             && !creature->GetScriptId();
     }
-}
 
-namespace
-{
     // Returns false when this player must not be offered a vault list on this creature. The
     // menu is then left exactly as PrepareGossipMenu built it and nothing has been sent, so the
     // caller can hand the NPC back to the core untouched.
@@ -89,7 +90,7 @@ namespace
 
         // The vault list stands in for the stock banker option, so it may only be offered where
         // that option was. PrepareGossipMenu drops an option whose `conditions` row fails
-        // (PlayerGossip.cpp:58), and GOSSIP_OPTION_BANKER has no other check, so a banker
+        // (PlayerGossip.cpp:60), and GOSSIP_OPTION_BANKER has no other check, so a banker
         // option surviving into the built menu is the core's own statement that this player may
         // use this bank. Jeeves (35642) is the only creature in the stock database that gates
         // one -- CONDITION_SKILL 202/350, Engineering 350 -- and without this the vault list
@@ -182,10 +183,7 @@ namespace
         SendGossipMenuFor(player, player->GetGossipTextId(creature), creature);
         return true;
     }
-}
 
-namespace
-{
     void SendRenameMenu(Player* player, Creature* creature)
     {
         ObjectGuid const playerGuid = player->GetGUID();
@@ -195,7 +193,10 @@ namespace
 
         for (uint8 vault : owned)
         {
-            if (!CanAddMenuItem(player))
+            // One slot held back for "Back". A rename list the player cannot leave would be
+            // worse than one that is short a vault. Unreachable at a vault limit of 20, and
+            // free.
+            if (!CanAddMenuItem(player, 1))
                 break;
 
             std::string const name = sExtendedBankMgr->GetVaultName(playerGuid, vault);

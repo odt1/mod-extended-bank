@@ -31,7 +31,11 @@ The module never composes a `character_inventory` row itself. It reaches that ta
 through core helpers: `Item::DeleteFromInventoryDB` for an item taken *into* a vault, and
 `Player::SaveInventoryAndGoldToDB` so the *core* writes rows for items that left one.
 
-`SelfHealVaultRows` is the insurance: at login it drops any vault row whose item has turned up
+The split between the two storage files runs along that invariant: `ExtendedBankStorage.cpp`
+decides which table an item belongs to and is the only file that constructs, places or frees
+an `Item`; `ExtendedBankVaults.cpp` only ever reads, names, buys or renames one.
+
+`SelfHealVaultRows` is the single crossing, and the insurance: at login it drops any vault row whose item has turned up
 somewhere the core owns — `character_inventory`, `mail_items`, `auctionhouse` or
 `guild_bank_item`. The last three matter because `Player::GetItemByGuid` scans bank slots and
 bank bags (`PlayerStorage.cpp:423,435`), so `CMSG_SEND_MAIL` and `CMSG_AUCTION_SELL_ITEM` can
@@ -92,6 +96,25 @@ Other landmines, each already paid for once:
   row yet (`m_additionalSaveTimer = 2000`, `PlayerStorage.cpp:7299`). `PersistVaultLayout`
   writes the vault row *before* `Item::SaveToDB` creates that row, which is safe only because
   both are in the same transaction. Splitting them would strand items looted seconds earlier.
+- **The vault name is the module's only interpolated SQL value, and truncation must precede
+  escaping.** `TruncateAndQuote` in `ExtendedBankVaults.cpp` holds both steps so they cannot be
+  reordered. Escaping first and truncating after can bisect an escape pair, leaving a trailing
+  backslash that escapes the statement's own closing quote. A prepared statement would make the
+  point moot but is not reachable from a module: they are registered in the core's
+  `CharacterDatabaseStatements` enum and `DoPrepareStatements`. Three things keep it safe and
+  all three are load-bearing — the format string stays a literal so the name is only ever an
+  fmt argument, the value stays inside single quotes, and nothing else in the module
+  interpolates player-supplied text into SQL.
+- **Optimistic bookkeeping: the module records what it *sent*, not what committed.**
+  `CaptureLayout` and `SyncVaultBagSlots` update their in-memory state immediately after
+  `CommitTransaction`, which is asynchronous and reports nothing back. If that transaction
+  aborts, the session believes rows exist that were never written, and because both are
+  difference-driven they will never emit them again: `ComputeLayoutDelta` compares against the
+  wrong baseline, and the `meta->BagSlots == liveCount` guard suppresses the retry. Nothing
+  visible happens in game. `Errors.log` is the only signal, and `SelfHealVaultRows` plus
+  `LoadVaultList` at the next login are the repair. Fixing this properly needs commit
+  completion feedback the async pool does not provide, so the mitigation is the one the delta
+  flush already carries: never write a statement that can collide.
 - **`Player::Update` runs on the `MapUpdater` pool.** With `MapUpdate.Threads > 1`, two players
   on different maps reach the manager's containers in the same tick. Every entry point takes a
   `std::recursive_mutex`; the two hot hooks check an `std::atomic` count first.
@@ -101,7 +124,8 @@ Other landmines, each already paid for once:
 | File | Responsibility |
 |---|---|
 | `src/ExtendedBank.h` | constants, config cache, `ExtendedBankMgr` |
-| `src/ExtendedBankStorage.cpp` | attach/detach/flush, every DB access — the whole invariant lives here |
+| `src/ExtendedBankStorage.cpp` | attach/detach/flush and every item write — the invariant lives here |
+| `src/ExtendedBankVaults.cpp` | `mod_extended_bank_vaults`: the metadata list, queries, buy, rename, login |
 | `src/ExtendedBankGossip.cpp` | `AllCreatureScript` menu + the `ServerScript` packet hook |
 | `src/ExtendedBankPlayer.cpp` | `PlayerScript` lifecycle hooks |
 | `src/ExtendedBankConfig.cpp` | `ConfigValueCache` + `WorldScript` |
@@ -116,7 +140,7 @@ returning true, so claiming one would suppress its own script.
 
 The vault list stands in for the stock `GOSSIP_OPTION_BANKER` entry, so it is offered **only
 where that entry is**. `PrepareGossipMenu` omits an option whose `conditions` row fails
-(`PlayerGossip.cpp:58`) and applies no further check to a banker option, so one surviving into
+(`PlayerGossip.cpp:60`) and applies no further check to a banker option, so one surviving into
 the built menu is the core's own statement that this player may bank here — no condition
 evaluation is duplicated. On refusal `SendMainMenu` returns false having changed nothing, and
 the core re-runs `PrepareGossipMenu` (idempotent; it opens with `ClearMenus`) and sends through
