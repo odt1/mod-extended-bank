@@ -73,9 +73,9 @@ them belongs to the current run.
 
 ## 2. Gossip surface
 
-- [ ] A plain banker without the gossip flag — most of them. *Covers the
+- [x] A plain banker without the gossip flag — most of them. *Covers the
       `CMSG_BANKER_ACTIVATE` interception.*
-- [ ] A banker that also carries `UNIT_NPC_FLAG_GOSSIP`. *Covers `CanCreatureGossipHello`.*
+- [x] A banker that also carries `UNIT_NPC_FLAG_GOSSIP`. *Covers `CanCreatureGossipHello`.*
       Both routes must produce the same menu.
 - [ ] A banker that is also an innkeeper or vendor: its own options survive below the vault list
       and any sub-menu they open still works. *Proves the snapshot-and-rebuild carries
@@ -102,7 +102,7 @@ them belongs to the current run.
       `AddGossipItemFor` in this module is already behind `CanAddMenuItem`, and the carried-item
       loop logs how many it dropped, so the guard is there for a modded realm rather than for
       anything shipped.*
-- [ ] Selecting a vault closes the gossip window with nothing left behind.
+- [x] Selecting a vault closes the gossip window with nothing left behind.
 
 ## 3. The storage invariant
 
@@ -128,7 +128,7 @@ The section that matters most.
       previous flush rather than being lost.*
 - [x] The same swap between a top-level bank slot and a slot inside a bank bag, and between two
       different bank bags.
-- [ ] Rearrange inside vault 1, switch to vault 2, switch back. The rearrangement stuck. *Proves
+- [x] Rearrange inside vault 1, switch to vault 2, switch back. The rearrangement stuck. *Proves
       the default-vault branch of `PersistOutgoingVault`.*
 - [x] Rearrange inside vault 2, walk away to force a revert, return. Layout preserved.
 - [x] Put a bag in a bank bag slot of vault 2, fill it, switch away and back. Bag and contents
@@ -173,7 +173,7 @@ The section that matters most.
       A/B could not reproduce it, and the server count was correct every time. Investigated
       2026-09-02 and closed unreproduced; `OpenVault` now closes the gossip frame explicitly as
       a precaution. If it reappears, capture whether the frame was opened via gossip or via a
-      direct `SMSG_SHOW_BANK` -- that was the variable under suspicion.
+      direct `SMSG_SHOW_BANK` -- that was the variable under suspicion. Seems again like an ElvUI-specific issue.
 - [ ] Buy up to 7 slots in vault 2, then switch to a vault with fewer. Nothing is mailed.
 
 ## 5. Buying
@@ -191,8 +191,8 @@ The section that matters most.
 
 ## 6. Renaming
 
-- [ ] `|cff00ff00Herbs|r` renders coloured in both menus and survives a relog.
-- [ ] An inline icon: `|TInterface\Icons\INV_Misc_Bag_08:16|t Alts`.
+- [x] `|cff00ff00Herbs|r` renders coloured in both menus and survives a relog.
+- [x] An inline icon: `|TInterface\Icons\INV_Misc_Bag_08:16|t Alts`.
 - [x] Paste a very long name. Truncated to 240 characters, the gossip window still renders, and
       **no MySQL 1406** in `Errors.log`. *This is the bug that broke the UI outright.*
 - [x] A name of multi-byte characters (Cyrillic, CJK) at the limit: truncation lands on a
@@ -223,13 +223,38 @@ The section that matters most.
 
 ## 8. Crash and recovery
 
-Hard-kill means Task Manager → End Task, **not** `.server shutdown`.
+Two different kills, proving two different things, and they are not interchangeable.
 
-- [x] Hard-kill with vault 2 open and items in it. Restart, log in: vault 1 intact, vault 2 at
+**Server hard-kill** — `Stop-Process -Name worldserver -Force`, **not** `.server shutdown`. The
+process dies with no logout path at all, so nothing the module holds in memory is written. This
+is what tests the on-disk state and the login-time repairs.
+
+**Client hard-kill** — SuperF4 on `wow.exe`. The server survives and runs its normal link-dead
+logout, so this tests that `OnPlayerBeforeLogout` → `FlushAndDetachForLogout` fires on an abrupt
+disconnect rather than only on a clean `/logout`. A client kill can never exercise a login
+repair: the server saved correctly on the way out, so there is nothing left to repair. That
+distinction cost a wasted run once — see the bank-bag-slot entry below.
+
+### Client kill (abrupt disconnect)
+
+- [x] Drag an item **out of** vault 2, kill `wow.exe` instantly. Item `12522091` ended up in
+      exactly one place, `character_inventory` bag 0 slot 25; `.vault info` then read
+      `Active vault: 1 (no session)`, so the revert fired without a clean logout;
+      `characters.bankSlots = 1` (vault 1's count), so the core would not mail vault 1's bags
+      back at the next login; vault 2's rows intact. *Proves the logout hook is reached on a
+      dropped connection, which is the only thing standing between an abrupt disconnect and a
+      vault left live in the bank slots.*
+- [x] The same with an item moved **inside** a bank bag in the vault.
+- [x] Two disconnects and a hard kill inside the long switching run that left
+      `character_inventory` byte-identical to its opening baseline (§3).
+
+### Server kill
+
+- [x] Server hard-kill with vault 2 open and items in it. Restart, log in: vault 1 intact, vault 2 at
       its last saved state, nothing duplicated, no bags mailed. Run every invariant check.
 - [x] Hard-kill immediately after dragging an item **out** of a vault. It ends up in exactly one
       place. *This is the window the single-transaction flush closes.*
-- [ ] Hard-kill immediately after dragging an item **into** a vault.
+- [x] Hard-kill immediately after dragging an item **into** a vault.
 - [ ] Hard-kill during a switch, while the swap is in flight.
 - [x] Hard-kill while a vault with a *different* bank bag slot count is open, with a bag
       actually placed in the default vault's bank bag slot. **The one crash case with teeth** —
@@ -302,7 +327,7 @@ Two genuine exceptions were found by that sweep and are listed separately: the t
 - [ ] Post an auction; cancel an auction.
 - [ ] Deposit into and withdraw from the guild bank.
 - [ ] Refund a recently bought item.
-- [ ] Wrap an item as a gift. *`ItemHandler.cpp:1205`, the site the README used to mislabel as
+- [ ] Wrap an item as a gift. *`ItemHandler.cpp:1205`, the site the docs used to mislabel as
       mail.*
 - [ ] Open a lockbox or container item. *`SpellHandler.cpp:318`.*
 - [ ] Open a trade window with a vault open — switching must be refused.

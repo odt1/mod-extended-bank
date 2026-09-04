@@ -6,7 +6,8 @@ An AzerothCore module. The core repo two levels up carries `AGENTS.md` with proj
 (formatting, SQL placement, "do not configure or build unless explicitly asked") — those apply
 here and are not repeated. This file covers only what is specific to mod-extended-bank.
 
-`README.md` is the design document and explains *why* each mechanism exists.
+`IMPLEMENTATION.md` is the design document and explains *why* each mechanism exists.
+`README.md` is the user-facing page: installing, configuring and playing with it.
 `tools/TESTING.md` is the test plan, with `[x]` marking what has actually been observed passing.
 
 ## What it does
