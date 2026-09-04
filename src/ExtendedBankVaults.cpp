@@ -413,7 +413,7 @@ bool ExtendedBankMgr::BuyNextVault(Player* player)
     return true;
 }
 
-void ExtendedBankMgr::RenameVault(Player* player, uint8 vault, std::string const& name)
+bool ExtendedBankMgr::RenameVault(Player* player, uint8 vault, std::string const& name)
 {
     std::lock_guard<std::recursive_mutex> guard(_mutex);
 
@@ -427,7 +427,7 @@ void ExtendedBankMgr::RenameVault(Player* player, uint8 vault, std::string const
 
     ExtendedBankVault* meta = FindVault(playerGuid, vault);
     if (!meta)
-        return;
+        return false;
 
     // The client doubles every '|' when it sends the contents of an edit box, so a player who
     // types |cffff0000Herbs|r arrives here as ||cffff0000Herbs||r -- and '||' renders as a
@@ -465,4 +465,5 @@ void ExtendedBankMgr::RenameVault(Player* player, uint8 vault, std::string const
     // turned an over-length rename into a broken gossip window that survived the failed
     // UPDATE: the menu kept re-sending a name the database had rejected.
     meta->Name = std::move(stored);
+    return true;
 }

@@ -216,7 +216,9 @@ public:
     void UpdateRangeCheck(Player* player, uint32 diff);
 
     bool BuyNextVault(Player* player);
-    void RenameVault(Player* player, uint8 vault, std::string const& name);
+    // False when the character does not own that vault, which is the only way it can
+    // fail. Nothing is written in that case.
+    bool RenameVault(Player* player, uint8 vault, std::string const& name);
 
 private:
     /* -- vault metadata, in ExtendedBankVaults.cpp ------------------------ */

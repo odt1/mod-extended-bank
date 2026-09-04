@@ -416,12 +416,18 @@ half-detached state to unwind.
             1087 module statements before and after, session still attached, `.vault check`
             clean. This is the whole reason the rule helps performance as well as fairness —
             a ticking item was the only routine thing defeating the gate.
-- [ ] **Expiry of a duration item inside an open vault.** Not yet observed. On expiry
-      `Item::UpdateDuration` calls `owner->DestroyItem(GetBagSlot(), GetSlot(), true)` on a
-      **vault** item. Traced clean — the item leaves the live bank, lands in `delta.Removed`,
-      its vault row is deleted and `itemLeftVault` pulls the core save into the same
-      transaction. Check `check_invariants.sql` and that no orphan `item_instance` row
-      survives.
+**Expiry of a duration item inside an open vault — legacy path, no longer reachable.** Not a
+pending test. Since duration items are refused from vaults 2..N, nothing with a clock can be
+put in one, and anything already there is evicted the first time that vault is opened. What
+remains is a path that only a stale row or a future relaxation of the rule could reach, so it
+is recorded as exploit surface to re-examine if that rule ever changes, not as work owed.
+
+On expiry `Item::UpdateDuration` calls `owner->DestroyItem(GetBagSlot(), GetSlot(), true)` on a
+live bank item. Traced clean: the item leaves the live bank, lands in `delta.Removed`, its
+vault row is deleted and `itemLeftVault` pulls the core save into the same transaction. Never
+observed, and now hard to stage — it needs the check stubbed out, or a row inserted by hand.
+If the rule is ever narrowed (to `flagsCustom & 1`, say), this becomes reachable again and
+wants `check_invariants.sql` plus a check for an orphaned `item_instance` row.
 - [x] A vault open while `PlayerSaveInterval` elapses (300000 here, 900000 stock), several
       times over. *Same path as `.save`, which is covered, but timer-driven.* Verified
       2026-09-04 over a six-minute unattended window with vault 2 live: `characters.totaltime`
@@ -550,10 +556,13 @@ Two genuine exceptions were found by that sweep and are listed separately: the t
       console: no row is created, nothing owned is touched, and the name stays the synthesised
       default. `RenameVault` returns early on `!meta`, so the gossip path is guarded too — the
       menu only ever lists owned vaults, but a forged action would land on the same check.
-      **`.vault rename` reports a fabricated success for this case**, printing
-      `Vault 9 name is now 7 bytes: 'Vault 9'` because it echoes `GetVaultName`, which
-      synthesises a default for any vault number. Console-only cosmetic; the write path is
-      correct. Worth making `RenameVault` return a bool the command can report.
+      `.vault rename` used to report a fabricated success here, printing
+      `Vault 9 name is now 7 bytes: 'Vault 9'` because it echoed `GetVaultName`, which
+      synthesises a default for any vault number. Fixed 2026-09-05: `RenameVault` returns a
+      bool and the command prints `<name> does not own vault N. Nothing was written.` The
+      gossip path discards that return on purpose — its menu only lists owned vaults, so a
+      false there means a forged action and redrawing the menu is the right answer.
+      - [ ] Retest after the next build: `.vault rename <name> 9 Foo` prints the refusal.
 - [ ] `CMSG_BANKER_ACTIVATE` for a creature that is not a banker, and for one out of range.
 - [x] Vault switches spammed as fast as the client will send them.
 
@@ -631,7 +640,10 @@ Each needs a forged packet or an instrumented build.
 
 **Closed by construction, not by clicking:** §11's handler list — `opHandle->Call` exists in
 four places in the server and every one is preceded by the drain; §2's menu overflow — the
-richest banker menu in the game contributes one option beside the vault list.
+richest banker menu in the game contributes one option beside the vault list; §9's expiry of a
+duration item inside a vault — duration items are refused from vaults 2..N and evicted from
+them, so nothing with a clock is left to expire there. That last one is closed by a rule rather
+than by an argument, so it reopens if the rule is ever narrowed.
 
 **Out of scope:** ElvUI's bank bag slot purchase button, which stops appearing once the Main
 Vault owns all seven slots — not reproducible on the default UI; and the stock enUS gossip

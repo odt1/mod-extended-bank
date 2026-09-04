@@ -283,7 +283,9 @@ public:
         {
             uint8 const vault = static_cast<uint8>(action - EXTENDED_BANK_ACTION_RENAME_BASE);
 
-            // RenameVault ignores a vault this character does not own.
+            // The return value is discarded deliberately: this menu only ever lists vaults the
+            // character owns, so a false here means a forged action, and RenameVault has
+            // already declined to write anything. Redrawing the menu is the right answer.
             sExtendedBankMgr->RenameVault(player, vault, code ? code : "");
             SendRenameMenu(player, creature);
             return true;

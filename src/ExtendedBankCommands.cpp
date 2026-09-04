@@ -333,7 +333,15 @@ namespace
         if (!player)
             return true;
 
-        sExtendedBankMgr->RenameVault(player, vault, std::string(name));
+        // Reporting GetVaultName unconditionally used to invent a success: it synthesises
+        // "Vault N" for any number, so renaming a vault the character does not own printed
+        // `Vault 9 name is now 7 bytes: 'Vault 9'` while having written nothing at all.
+        if (!sExtendedBankMgr->RenameVault(player, vault, std::string(name)))
+        {
+            handler->PSendSysMessage("{} does not own vault {}. Nothing was written.",
+                player->GetName(), vault);
+            return true;
+        }
 
         std::string const stored = sExtendedBankMgr->GetVaultName(player->GetGUID(), vault);
         handler->PSendSysMessage("Vault {} name is now {} bytes: '{}'", vault, stored.size(), stored);
