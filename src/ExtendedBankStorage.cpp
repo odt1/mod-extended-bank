@@ -803,6 +803,19 @@ namespace
 
         return proto->MaxCount > 0 || proto->ItemLimitCategory != 0;
     }
+
+    // Allocation-free precondition for EvictRestrictedItems, which cannot answer "nothing to
+    // do" without first building a set of restricted bags and a vector of rejects. A bag's
+    // uncapped contents are only ever evicted because the bag itself is capped, and the bag is
+    // in this list too, so no restricted item can hide behind one.
+    bool AnyItemRestricted(std::vector<ExtendedBankItemPos> const& items)
+    {
+        for (ExtendedBankItemPos const& pos : items)
+            if (IsVaultRestricted(pos.ItemPtr->GetTemplate()))
+                return true;
+
+        return false;
+    }
 }
 
 bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedBankItemPos> const& items,
@@ -937,25 +950,55 @@ void ExtendedBankMgr::FlushLiveVault(Player* player, ExtendedBankSession& sessio
     std::vector<ExtendedBankItemPos> live;
     CollectLiveBankItems(player, live);
 
-    // Opened up front so eviction shares the commit that rewrites the vault rows. Dropped
-    // unused on the early return below, which discards its statements without executing them.
+    uint8 const bagSlots = player->GetBankBagSlotCount();
+    bool const restricted = AnyItemRestricted(live);
+
+    // The idle fast path, and the reason this function is shaped the way it is. It runs from
+    // OnPlayerUpdate on every tick and from CanPacketReceive on every packet, for as long as a
+    // vault is open -- and a player parked at a banker can hold that state open indefinitely,
+    // which `PreventAFKLogout = 2` turns from a contrivance into the ordinary case, since they
+    // cannot log out until they move. Everything below this point allocates: a transaction
+    // object, the eviction scan's set and vector, and the delta's hash map of up to 280
+    // entries. None of it may happen on a tick where nothing has changed.
+    //
+    // These four checks are exactly as strong as computing the delta and throwing it away,
+    // which is what this used to do:
+    //
+    //   - a bank layout cannot change without the core marking an item ITEM_CHANGED, so
+    //     anything that moved *within* the vault is caught by AnyItemQueued;
+    //   - an item that left the vault is queued but no longer in `live`, so AnyItemQueued
+    //     would miss it -- the size comparison is what catches that, and it is the case the
+    //     single-transaction flush exists for, so it must not be got wrong;
+    //   - an item that entered is both queued and in `live`, and changes the size;
+    //   - a purchased bag slot changes neither, hence the explicit comparison.
+    if (!saveCoreInventory && !restricted
+        && session.PersistedBagSlots == bagSlots
+        && session.PersistedLayout.size() == live.size()
+        && !AnyItemQueued(live))
+    {
+        return;
+    }
+
+    // Opened here so eviction shares the commit that rewrites the vault rows. Dropped unused
+    // on the backstop return below, which discards its statements without executing them.
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
 
-    // Unconditional, not gated on the layout having changed: this also has to catch items
-    // already sitting in a vault from before the rule existed, which arrive via AttachVault
-    // and would otherwise look like an unchanged layout.
-    bool const evicted = EvictRestrictedItems(player, live, trans, session.BankerGuid);
+    // Not gated on the layout having changed: this also has to catch items already sitting in
+    // a vault from before the rule existed, which arrive via AttachVault and would otherwise
+    // look like an unchanged layout. `restricted` is only the allocation-free half of the same
+    // question, so it can gate the call without narrowing it.
+    bool const evicted = restricted && EvictRestrictedItems(player, live, trans, session.BankerGuid);
     if (evicted)
     {
         live.clear();
         CollectLiveBankItems(player, live);
     }
 
-    uint8 const bagSlots = player->GetBankBagSlotCount();
     ExtendedBankLayoutDelta const delta = ComputeLayoutDelta(session, live, bagSlots);
 
-    // Nothing moved and nothing is dirty: the vault's items are already out of the queue, so
-    // there is nothing for _SaveInventory to get wrong and nothing to write.
+    // Backstop. By the argument above nothing should reach here with an empty delta, but this
+    // is the check that was load-bearing before the fast path was added, and leaving it costs
+    // nothing: it is only evaluated on a tick that already decided it had work to do.
     if (!delta.Any() && !evicted && !AnyItemQueued(live) && !saveCoreInventory)
         return;
 

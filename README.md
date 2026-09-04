@@ -12,15 +12,15 @@ No client addon, no custom frame, no client patch: right-click any banker, buy a
 
 ## Disclaimer
 
-Vibe-coded using Claude Opus 5 and `/code-review ultra` against the [AzerothCore mod-playerbots branch](https://github.com/mod-playerbots/azerothcore-wotlk/tree/Playerbot), but rigorously tested on a solo server as much as possible — see [tools/TESTING.md](tools/TESTING.md).
+✨Vibe-coded✨ using Claude Opus 5 and `/code-review ultra` against the [AzerothCore mod-playerbots branch](https://github.com/mod-playerbots/azerothcore-wotlk/tree/Playerbot), but rigorously tested by a real human on a solo server as much as possible — see [tools/TESTING.md](tools/TESTING.md).
 
 Issues, PRs, reports and extra testing all very welcome. Thanks, and enjoy!
 
 ## Requirements and Installation
 
-AzerothCore for WotLK 3.3.5a. No client changes and no other modules are needed.
+AzerothCore for WotLK. Playerbots branch is built and tested against, but the module has no playerbots references anywhere, so it *should* work on vanilla AzerothCore. No client changes and no other modules are needed.
 
-* Clone the repository to azerothcore/modules folder
+* Clone the repository to your azerothcore/modules folder
 * Re-run CMake
 * Recompile the core
 * Copy and edit `mod_extended_bank.conf.dist` to
@@ -79,6 +79,7 @@ Lowering `MaxVaults` later never hides or deletes anything — characters keep e
 - **`.pdump` does not carry vaults.** Dumping a character this way and loading it back loses vaults 2+.
 - **Faction and race changes do not convert items in vaults 2+.** Your main bank converts as usual.
 - **Playerbots always use Vault 1** and are otherwise unaffected.
+- **Non-Latin vault names may show as `?` on an English client using default Blizzard UI and Fonts.** Cyrillic, CJK and other non-Latin names are stored and sent correctly, but the vault list and the rename menu will render a `?`. A UI that replaces the game fonts, such as ElvUI, displays them correctly.
 - **ElvUI users:** ElvUI stops showing the bank bag slot purchase button once your main bank has bought all seven, and will not show it again in a vault that has fewer. This is an ElvUI problem — the default Blizzard bank frame handles it correctly — and `/run PurchaseSlot()` works as a complete substitute.
 
 ## Uninstalling

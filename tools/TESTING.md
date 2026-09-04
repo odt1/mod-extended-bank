@@ -13,7 +13,7 @@ one of three things, and the entry says which:
 - *genuinely pending* — worth doing, nobody has;
 - *not reachable* — the state cannot be produced from a client, and the entry says why (the
   trade race, a restricted bag with contents, the mail/auction reach-in);
-- *covered by construction* — a static argument settles it and clicking adds little. §10's
+- *covered by construction* — a static argument settles it and clicking adds little. §11's
   handler list is the main example.
 
 That distinction matters more than the count. Most of what is still unticked is closed, not
@@ -203,6 +203,13 @@ The section that matters most.
       a boundary with no partial sequence and nothing mangled. `VARCHAR(255)` counts characters
       rather than bytes in MySQL, so 240 fits — which is what the original `[1406] Data too
       long` failure was about.
+- [x] **Display of a non-Latin name is a client font limitation, not a module one.** Verified
+      2026-09-04: a 240-character Cyrillic name on vault 4 and a short one (`Травы`) on vault 3 both
+      render as a single `?` in the vault list *and* in the rename submenu on a default enUS
+      client, while `.vault info` prints both correctly in chat. Reloading with ElvUI enabled,
+      which replaces the game fonts, renders them properly. So the bytes are right the whole
+      way through — the stock gossip font simply has no glyphs for them. Length is irrelevant:
+      five characters fail exactly as 240 do.
 - [ ] Rename vault 1 — the label changes, its storage does not.
 - [x] Rename to an empty string: falls back to `Vault N`.
 
@@ -296,7 +303,53 @@ distinction cost a wasted run once — see the bank-bag-slot entry below.
       from a connection with no default database appears as a second row rather than
       incrementing the first.
 
-## 9. Concurrency
+## 9. Long sessions and AFK
+
+`PreventAFKLogout = 2` on this realm, so a player who goes AFK at a banker **cannot log out
+until they move** — the client refuses with "You can't logout now" and repeats it. That makes an
+open vault held for an unbounded time the ordinary case rather than a contrived one, and it is
+the scenario the idle fast path in `FlushLiveVault` exists for. Nothing about the refusal itself
+touches the module: `HandleLogoutRequestOpcode` sets `reason = 2`, calls `SetLogoutStartTime(0)`
+and returns *before* `LogoutPlayer` (`MiscHandler.cpp:429`), so no hook fires and there is no
+half-detached state to unwind.
+
+- [ ] Open vault 2, go AFK at the banker, wait 30 minutes, then move items. Layout persists,
+      invariants pass. *The plain soak.*
+- [x] The same, watching statement counts. An idle tick must issue **nothing**. Verified
+      2026-09-04 over 75 seconds with vault 2 live and the character standing still: the summed
+      `COUNT_STAR` for every `mod_extended_bank%` digest was 898 before and 898 after, and the
+      session was still attached at the end. Filter to the module's own digests when reading
+      this — `item_instance` sees constant unrelated traffic from other modules:
+
+      ```sql
+      SELECT DIGEST_TEXT, COUNT_STAR FROM performance_schema.events_statements_summary_by_digest
+      WHERE DIGEST_TEXT LIKE '%mod_extended_bank%' OR DIGEST_TEXT LIKE '%item_instance%';
+      ```
+
+      *Before the fast path this allocated a transaction, an eviction set and a delta hash map
+      of up to 280 entries on every tick and every packet, then threw them away. It never wrote
+      anything, so no statement count would have caught it — read the counts to confirm the
+      write path is still silent, and profile if you want the allocation half.*
+- [ ] Attempt a logout while AFK with vault 2 open, get refused, move, log out properly. The
+      vault reverts exactly as it does from a non-AFK logout. *Confirms the refusal really is
+      inert rather than leaving a partial state.*
+- [ ] **An item with a duration, in an open vault.** `.additem 46029` (Magnetic Core, 60s) is
+      unrestricted, so it is allowed in a vault; `1164` (Sam's Tome, 300s) and `13320` (Arcane
+      Quickener, 1800s) are longer variants. Two things to watch:
+      1. While it ticks, `Item::UpdateDuration` calls `SetState(ITEM_CHANGED, owner)` **every
+         real second** (`PlayerUpdates.cpp:111`, and `realtimeonly` defaults false so every
+         duration item ticks). `AnyItemQueued` is therefore true once a second, so the fast
+         path is skipped and a full `PersistVaultLayout` sweep runs — ~280 `Item::SaveToDB`
+         calls. Confirm the cost and decide whether it needs bounding.
+      2. On expiry it calls `owner->DestroyItem(GetBagSlot(), GetSlot(), true)` on a **vault**
+         item. Traced clean — the item leaves the live bank, lands in `delta.Removed`, its
+         vault row is deleted and `itemLeftVault` pulls the core save into the same transaction
+         — but never observed. Check `check_invariants.sql` and that no orphan `item_instance`
+         row survives.
+- [ ] A vault open while `PlayerSaveInterval` elapses (300000 here, 900000 stock), several
+      times over. *Same path as `.save`, which is covered, but timer-driven.*
+
+## 10. Concurrency
 
 `MapUpdate.Threads = 4` on this realm, so these are live risks, not theory.
 
@@ -306,7 +359,7 @@ distinction cost a wasted run once — see the bank-bag-slot entry below.
 - [ ] Several characters switching vaults repeatedly during a full `.save` sweep.
 - [ ] A vault open while the autosave interval elapses.
 
-## 10. Interaction with the rest of the core
+## 11. Interaction with the rest of the core
 
 Each of these reaches `_SaveInventory` **without** firing `OnPlayerSave` — which is exactly what
 the drain exists for. With a vault open, do the action, then check invariant 1.
@@ -397,7 +450,7 @@ Two genuine exceptions were found by that sweep and are listed separately: the t
 - [ ] `.pdump write` a character with vaults and load it back: confirm the documented loss of
       vaults 2..N is what actually happens, and that nothing is corrupted by it.
 
-## 11. Adversarial
+## 12. Adversarial
 
 - [x] A gossip select for a vault number you do not own. Refused. *`OpenVault` checks
       `OwnsVault`.*
@@ -416,21 +469,28 @@ an unresolved `ExtendedBankMgr::instance`.
 Everything else is meant to be behaviour-identical, so the quickest confidence check is §3 and
 §4 end to end. The four deliberate changes, each cheap to confirm:
 
-- [ ] `.vault check` on a character who has never bought or opened a vault prints
+- [x] `.vault check` on a character who has never bought or opened a vault prints
       `SKIP bag-slot-check` instead of a spurious `FAIL bag-slot-mismatch`. It was comparing a
       purchased bank bag slot count against the 0 returned for a vault with no metadata row.
       The skip is narrow: a *non-default* vault open with no row is now its own failure,
       `FAIL missing-vault-row`, because that is the state that stops `LoadPlayer` restoring
-      `PLAYER_BYTES_2` and gets the vault's bank bags mailed back.
-- [ ] Re-opening a vault that is *already* open, from a **different** banker, rebinds the
-      banker and restarts the range-check interval. Walk between two bankers without switching
-      vaults; the vault must stay loaded. Re-opening from the *same* banker deliberately leaves
-      the timer alone, so a client repeating the packet cannot hold the range check off.
+      `PLAYER_BYTES_2` and gets the vault's bank bags mailed back. Verified 2026-09-04 on a
+      freshly created character — `SKIP bag-slot-check: the Main Vault has no metadata row
+      yet ...` then `OK: vault 1 consistent, 0 live items`, and the check itself left no
+      `mod_extended_bank_vaults` row behind. It needed a new character: every existing test
+      character already owned a vault-1 row.
+- [x] Re-opening a vault that is *already* open, from a **different** banker, rebinds the
+      banker and restarts the range-check interval. Verified 2026-09-04: opened at creature
+      20063, walked away, opened at 20065; the session's banker GUID followed, and the vault
+      was still loaded and `.vault check`-clean after 40s standing at the second banker — had
+      it kept the first banker's GUID, the range check would have reverted it within a second.
+      Re-opening from the *same* banker deliberately leaves the timer alone, so a client
+      repeating the packet cannot hold the range check off.
 - [ ] The rename list holds one menu slot back for **Back**. Unreachable at a vault limit of 20;
       confirm the menu still looks the same.
 - [ ] `IsVaultRestricted` is now the exact negation of `Player::CanTakeMoreSimilarItems`'s "no
       maximum" test, which treats `MaxCount == 2147483647` as unlimited even when the item also
-      carries an `ItemLimitCategory`. Both forms select the same 5802 shipped templates, so §10
+      carries an `ItemLimitCategory`. Both forms select the same 5802 shipped templates, so §11
       should behave identically; only a custom item could tell them apart.
 - [ ] **The eviction notice names the item that actually moved.** A capped *bag* drags its
       uncapped contents out of the vault with it. If the bag fits back into the player's bags
@@ -438,7 +498,7 @@ Everything else is meant to be behaviour-identical, so the quickest confidence c
       been mailed -- it tracked one name plus a ''did anything mail'' counter, and the counter
       was set by the loose item. It now tracks the first mailed item separately and prefers it,
       since that is the one the player cannot see arrive. Same unreachable-from-a-client
-      caveat as the restricted-bag entry in §10.
+      caveat as the restricted-bag entry in §11.
 - [ ] **Refund and soulbound-trade registrations on a mailed-back item.** `AttachVault` runs
       `RestoreItemSideData` *before* trying to place an item, so an item that then fails to
       place was registered in `m_refundableItems` and/or `m_itemSoulboundTradeable` and was
@@ -454,7 +514,7 @@ Everything else is meant to be behaviour-identical, so the quickest confidence c
 Short list, so the 40-odd unticked boxes above do not read as a backlog.
 
 **Genuinely pending, reachable:** the remaining §5 purchase edge cases; §6 rename of a vault you
-do not own; `.pdump` round-trip; a stack that merges on attach; §9's multi-character concurrency
+do not own; `.pdump` round-trip; a stack that merges on attach; §10's multi-character concurrency
 entries beyond the ones already run.
 
 **Not reachable from a client, and why:** the trade-partner race (the bank and trade frames
@@ -462,9 +522,11 @@ cannot both be open, and hiding the trade frame cancels the trade); a restricted
 ordinary contents inside a vault; the mail/auction reach-in that `SelfHealVaultRows` repairs.
 Each needs a forged packet or an instrumented build.
 
-**Closed by construction, not by clicking:** §10's handler list — `opHandle->Call` exists in
+**Closed by construction, not by clicking:** §11's handler list — `opHandle->Call` exists in
 four places in the server and every one is preceded by the drain; §2's menu overflow — the
 richest banker menu in the game contributes one option beside the vault list.
 
 **Out of scope:** ElvUI's bank bag slot purchase button, which stops appearing once the Main
-Vault owns all seven slots. Not reproducible on the default UI.
+Vault owns all seven slots — not reproducible on the default UI; and the stock enUS gossip
+font's lack of non-Latin glyphs, which renders such vault names as `?` — not reproducible
+under a UI that replaces the fonts. Neither is reachable from module code.
