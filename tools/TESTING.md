@@ -38,7 +38,12 @@ grep -i mod_extended_bank_vault_items build/bin/RelWithDebInfo/logs/Errors.log
 ```
 
 Both log files open in `w` mode, so they are truncated at every server start and anything in
-them belongs to the current run.
+them belongs to the current run. **`.reload config` truncates them too**, and that is easy to
+walk into: `World::LoadConfigSettings(reload = true)` calls `sLog->LoadFromConfig()`
+(`World.cpp:178`), which closes and rebuilds every appender, and `AppenderFile` reopens with
+the configured mode. So an empty log proves nothing about the run if a config has been reloaded
+since — read it *before* reloading, or restart instead. Observed 2026-09-05: sixteen lines
+vanished across three reloads while changing `MaxVaults`.
 
 ## 0. Instrumentation first
 
@@ -179,10 +184,21 @@ The section that matters most.
 ## 5. Buying
 
 - [x] Buy vault 2: gold deducted matches `VaultCost[0]`. (Happy path.)
-- [ ] Buy up to `MaxVaults`; the next attempt is refused and takes no money.
-- [ ] Attempt with insufficient gold: refused, no money taken, no row created.
-- [ ] Lower `MaxVaults` below what you own, `.reload config`: owned vaults still open, only
-      buying is blocked.
+- [x] Buy up to `MaxVaults`; the next attempt is refused and takes no money. Verified
+      2026-09-05 with `MaxVaults` temporarily at 3: vault 3 cost exactly 10000000 copper
+      (`VaultCost[1]`, 1000g) and the attempt at vault 4 was refused with the balance unchanged
+      to the copper.
+- [x] Attempt with insufficient gold: refused, no money taken, no row created. Verified
+      2026-09-05 with 110607473 copper against vault 8's price of 900000000: refused, balance
+      unchanged to the copper, and the vault row count was 7 before and 7 after — no partial
+      row. All seven `VaultCost` entries were exercised in the same run (100, 1000, 2500, 6000,
+      18000, 38000, 90000 gold), each deducted exactly, totalling 1556000000 copper.
+- [x] Lower `MaxVaults` below what you own, `.reload config`: owned vaults still open, only
+      buying is blocked. Verified 2026-09-05 on a character owning three vaults with the limit
+      dropped to two: buying refused with no deduction, while vault 3 — the one above the
+      limit — still opened, listed and reverted normally, and `.vault check` passed on it.
+      `GetOwnedVaults` deliberately does not filter by the limit. The reload itself took effect
+      with no restart.
 - [ ] `ExtendedBank.VaultCost = "100,500000"` and reload: the log clamps it and the menu shows
       214748, not a small wrapped number. *Guards the `uint32` overflow.*
 - [ ] Delete a `mod_extended_bank_vaults` row by hand while the character is offline, log in, and
@@ -210,7 +226,9 @@ The section that matters most.
       which replaces the game fonts, renders them properly. So the bytes are right the whole
       way through — the stock gossip font simply has no glyphs for them. Length is irrelevant:
       five characters fail exactly as 240 do.
-- [ ] Rename vault 1 — the label changes, its storage does not.
+- [x] Rename vault 1 — the label changes, its storage does not. Verified 2026-09-04: renamed to
+      `Main Stash` and back, with `character_inventory` and every vault row byte-identical either
+      side of both renames.
 - [x] Rename to an empty string: falls back to `Vault N`.
 
 ## 7. Lifecycle
@@ -225,8 +243,12 @@ The section that matters most.
 - [x] Log out from inside the bank frame with vault 2 open. Relog: vault 1 with its original
       contents, vault 2 still listed and intact.
 - [x] Get disconnected rather than logging out cleanly (pull the network).
-- [ ] Delete the character: both module tables lose its rows and no `item_instance` rows survive
-      (checks 5 and 11).
+- [x] Delete the character: both module tables lose its rows and no `item_instance` rows
+      survive (checks 5 and 11). Verified 2026-09-05 by erasing a character owning eight vaults
+      while offline: `characters`, `mod_extended_bank_vaults`, `mod_extended_bank_vault_items`,
+      `item_instance` and `character_inventory` all went to zero rows for that guid, with
+      invariants clean. Note `.character erase` kicks an online character before deleting, so
+      run it offline to test the ordinary path.
 
 ## 8. Crash and recovery
 
@@ -313,8 +335,8 @@ touches the module: `HandleLogoutRequestOpcode` sets `reason = 2`, calls `SetLog
 and returns *before* `LogoutPlayer` (`MiscHandler.cpp:429`), so no hook fires and there is no
 half-detached state to unwind.
 
-- [ ] Open vault 2, go AFK at the banker, wait 30 minutes, then move items. Layout persists,
-      invariants pass. *The plain soak.*
+- [x] Open vault 2, go AFK at the banker, wait 30 minutes, then move items. Layout persists,
+      invariants pass. *The plain soak.* Run manually 2026-09-03.
 - [x] The same, watching statement counts. An idle tick must issue **nothing**. Verified
       2026-09-04 over 75 seconds with vault 2 live and the character standing still: the summed
       `COUNT_STAR` for every `mod_extended_bank%` digest was 898 before and 898 after, and the
@@ -333,21 +355,90 @@ half-detached state to unwind.
 - [ ] Attempt a logout while AFK with vault 2 open, get refused, move, log out properly. The
       vault reverts exactly as it does from a non-AFK logout. *Confirms the refusal really is
       inert rather than leaving a partial state.*
-- [ ] **An item with a duration, in an open vault.** `.additem 46029` (Magnetic Core, 60s) is
-      unrestricted, so it is allowed in a vault; `1164` (Sam's Tome, 300s) and `13320` (Arcane
-      Quickener, 1800s) are longer variants. Two things to watch:
-      1. While it ticks, `Item::UpdateDuration` calls `SetState(ITEM_CHANGED, owner)` **every
-         real second** (`PlayerUpdates.cpp:111`, and `realtimeonly` defaults false so every
-         duration item ticks). `AnyItemQueued` is therefore true once a second, so the fast
-         path is skipped and a full `PersistVaultLayout` sweep runs — ~280 `Item::SaveToDB`
-         calls. Confirm the cost and decide whether it needs bounding.
-      2. On expiry it calls `owner->DestroyItem(GetBagSlot(), GetSlot(), true)` on a **vault**
-         item. Traced clean — the item leaves the live bank, lands in `delta.Removed`, its
-         vault row is deleted and `itemLeftVault` pulls the core save into the same transaction
-         — but never observed. Check `check_invariants.sql` and that no orphan `item_instance`
-         row survives.
-- [ ] A vault open while `PlayerSaveInterval` elapses (300000 here, 900000 stock), several
-      times over. *Same path as `.save`, which is covered, but timer-driven.*
+- [x] **An item with a duration, in an open vault.** Run 2026-09-04 with `.additem 46029`
+      (Magnetic Core, 60s). **A duration only advances while its vault is loaded.** Detaching a
+      vault runs `Player::RemoveItem`, which calls `RemoveItemDurations`, so the item leaves
+      `m_itemDuration` and its clock stops; re-attaching puts it back. Nothing is lost — the
+      value freezes and resumes, and `item_instance.duration` stays correct — but it is a real
+      behavioural difference from the Main Vault, where the clock runs the whole time the
+      character is online.
+
+      **It is mostly not a new capability, and the exception is small.** `Player::UpdateItemDuration`
+      is called at login as `UpdateItemDuration(time_diff, true)` (`PlayerStorage.cpp:5584`),
+      and `realtimeonly` skips anything without `ITEM_FLAGS_CU_DURATION_REAL_TIME`
+      (`PlayerStorage.cpp:4259`) — so an ordinary duration item in a *vanilla* bank already
+      stops ticking while the character is logged out. A stowed vault is "logged out" for that
+      item while the player happens to be online. Measured over `item_template`: 280 templates
+      carry a duration, 134 of them are already refused by `IsVaultRestricted`, and of the
+      remaining 146 exactly **70 carry the real-time flag** — the only set for which a vault
+      pauses a clock vanilla would keep running. All 70 are holiday cosmetics (Hallow's End
+      masks, Flying Brooms, orphan whistles, Speckled Tastyfish).
+
+      **The flush cost is far lower than this entry used to claim.** While it ticks,
+      `Item::UpdateDuration` calls `SetState(ITEM_CHANGED, owner)` every real second
+      (`PlayerUpdates.cpp:111`), so `AnyItemQueued` is true once a second and the idle fast
+      path is skipped. But the resulting `PersistVaultLayout` sweep is not ~280 statements:
+      `Item::SaveToDB` reaches `case ITEM_UNCHANGED: break` (`Item.cpp:410`) for every item
+      that has not changed, so it emits exactly **one** `UPDATE item_instance`. What repeats
+      per second is a transaction object, the eviction scan and a delta hash map — the
+      pre-fast-path steady state, for one player.
+
+      **Duration items are now refused from vaults 2..N** (`IsVaultRestricted`, 2026-09-04).
+      The argument that vanilla already pauses them was wrong about what the pause costs:
+      vanilla's is paid for in playing time, since to stop the clock the player has to stop
+      playing, while a vault stops the same clock for free and leaves the item reachable at any
+      banker. That holds for every duration item, not just the 70 real-time-flagged ones, so
+      the rule is on `Duration != 0` rather than on `flagsCustom & 1`. It moves 146 templates
+      from allowed to refused; the other 134 were already refused for being capped.
+
+      Retest after the next build:
+      - [x] Drag a duration item into vault 2 from the bags: refused, returned to the bags,
+            whisper and chat line name it. Verified 2026-09-05 with the Rickety Magic Broom.
+      - [x] The bags-full mail path. **Not reachable by filling the bags and dragging to an
+            empty slot** — the item came from the bag slot it would return to, so it always
+            bounces. The route is dropping it onto an *occupied* vault slot, whose swap refills
+            the source; see the entry in §11, verified 2026-09-02. `EvictRestrictedItems` does
+            not branch on why an item is restricted, so a duration item takes the identical
+            path a capped one does.
+      - [x] A duration item already sitting in a vault from before the rule existed: opening
+            that vault evicts it. Verified 2026-09-05 for two items in two vaults — a Rickety
+            Magic Broom in vault 4 and a Magnetic Core in vault 2, both placed before the
+            build carrying the rule. Opening each vault evicted its item to the bags with the
+            usual notice; no vault row, no mail row, `item_instance.owner_guid` intact, each
+            in exactly one place, invariants clean. The Magnetic Core came out with **46 of
+            its 60 seconds left** after hours stowed and a server restart, which is the
+            clearest demonstration of the freeze this rule exists to stop: its clock only
+            resumed once eviction put it back in the bags.
+      - [x] The Main Vault still accepts one, since that *is* `character_inventory`. Verified
+            2026-09-05.
+      - [x] With no duration item in the vault, the idle fast path is silent again. Verified
+            2026-09-05 over 96 seconds with vault 2 live and the character standing still:
+            1087 module statements before and after, session still attached, `.vault check`
+            clean. This is the whole reason the rule helps performance as well as fairness —
+            a ticking item was the only routine thing defeating the gate.
+- [ ] **Expiry of a duration item inside an open vault.** Not yet observed. On expiry
+      `Item::UpdateDuration` calls `owner->DestroyItem(GetBagSlot(), GetSlot(), true)` on a
+      **vault** item. Traced clean — the item leaves the live bank, lands in `delta.Removed`,
+      its vault row is deleted and `itemLeftVault` pulls the core save into the same
+      transaction. Check `check_invariants.sql` and that no orphan `item_instance` row
+      survives.
+- [x] A vault open while `PlayerSaveInterval` elapses (300000 here, 900000 stock), several
+      times over. *Same path as `.save`, which is covered, but timer-driven.* Verified
+      2026-09-04 over a six-minute unattended window with vault 2 live: `characters.totaltime`
+      advanced by 338, so a full `SaveToDB` did fire; the vault stayed loaded, `.vault check`
+      passed, `check_invariants.sql` was clean, `Errors.log` did not grow, and every
+      `character_inventory` and vault row was byte-identical either side. The server issued
+      **no `mod_extended_bank%` statement at all** across the window, nor from a subsequent
+      explicit `.saveall` — the delta is empty, so the forced-past-the-fast-path flush writes
+      nothing but `item_instance` rows through `Item::SaveToDB`.
+
+      One expected difference: `characters.bankSlots` went 7 to 3, because the save wrote the
+      *live* count, which is the open vault's. That is the state §3's login correction exists
+      for, and normal logout reverts to vault 1 before the final save.
+
+      *Beware when reading digest counts this way: `tools/`-style snapshot scripts query the
+      module's own tables, so they inflate the count they are measuring. Two of the statements
+      first attributed to this window turned out to be the harness reading the result.*
 
 ## 10. Concurrency
 
@@ -357,7 +448,7 @@ half-detached state to unwind.
       bankers at the same moment. *Reaches `_vaults`/`_sessions` from two `MapUpdater` threads.*
 - [ ] The same two, logging out simultaneously.
 - [ ] Several characters switching vaults repeatedly during a full `.save` sweep.
-- [ ] A vault open while the autosave interval elapses.
+- [x] A vault open while the autosave interval elapses. *Covered by the §9 entry.*
 
 ## 11. Interaction with the rest of the core
 
@@ -455,7 +546,14 @@ Two genuine exceptions were found by that sweep and are listed separately: the t
 - [x] A gossip select for a vault number you do not own. Refused. *`OpenVault` checks
       `OwnsVault`.*
 - [x] A vault number above 255, so the `uint8` cast wraps to 0.
-- [ ] A rename for a vault you do not own.
+- [x] A rename for a vault you do not own. Verified 2026-09-04 for vaults 9, 200 and 0 over the
+      console: no row is created, nothing owned is touched, and the name stays the synthesised
+      default. `RenameVault` returns early on `!meta`, so the gossip path is guarded too — the
+      menu only ever lists owned vaults, but a forged action would land on the same check.
+      **`.vault rename` reports a fabricated success for this case**, printing
+      `Vault 9 name is now 7 bytes: 'Vault 9'` because it echoes `GetVaultName`, which
+      synthesises a default for any vault number. Console-only cosmetic; the write path is
+      correct. Worth making `RenameVault` return a bool the command can report.
 - [ ] `CMSG_BANKER_ACTIVATE` for a creature that is not a banker, and for one out of range.
 - [x] Vault switches spammed as fast as the client will send them.
 
@@ -488,10 +586,19 @@ Everything else is meant to be behaviour-identical, so the quickest confidence c
       repeating the packet cannot hold the range check off.
 - [ ] The rename list holds one menu slot back for **Back**. Unreachable at a vault limit of 20;
       confirm the menu still looks the same.
-- [ ] `IsVaultRestricted` is now the exact negation of `Player::CanTakeMoreSimilarItems`'s "no
+- [x] `IsVaultRestricted` is now the exact negation of `Player::CanTakeMoreSimilarItems`'s "no
       maximum" test, which treats `MaxCount == 2147483647` as unlimited even when the item also
       carries an `ItemLimitCategory`. Both forms select the same 5802 shipped templates, so §11
-      should behave identically; only a custom item could tell them apart.
+      should behave identically; only a custom item could tell them apart. Verified 2026-09-04
+      by evaluating both predicates over all 46098 rows of `item_template`: 5802 each and **zero
+      disagreements**, which is stronger than the equal counts alone.
+
+      ```sql
+      SELECT SUM(CASE WHEN (NOT ((MaxCount <= 0 AND ItemLimitCategory = 0) OR MaxCount = 2147483647))
+                       <> ((MaxCount <> 2147483647) AND (MaxCount > 0 OR ItemLimitCategory <> 0))
+                      THEN 1 ELSE 0 END) AS disagreements
+      FROM item_template;
+      ```
 - [ ] **The eviction notice names the item that actually moved.** A capped *bag* drags its
       uncapped contents out of the vault with it. If the bag fits back into the player's bags
       while a loose item from inside it does not, the whisper used to name the bag as having

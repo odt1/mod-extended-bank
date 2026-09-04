@@ -195,9 +195,16 @@ anything into an empty log.
 
 A failed statement never appears there at all: `Logger.sql.sql` routes to the **Errors**
 appender, so `Errors.log` is where an aborted flush shows up, with its SQL. Both files open in
-`w` mode and truncate at startup, so their contents always belong to the current run. This
-matters more than it sounds — commits are asynchronous, so a failed flush is completely silent
+`w` mode and truncate at startup — and at every `.reload config`, which reaches
+`sLog->LoadFromConfig()` through `World::LoadConfigSettings` (`World.cpp:178`) and rebuilds
+every appender. So their contents always belong to the current run, but an empty log proves
+nothing if a config was reloaded after the thing being checked. This matters more than it
+sounds — commits are asynchronous, so a failed flush is completely silent
 in game and the vault merely appears to revert an edit.
 
-Non-ASCII text is mangled to `?` by the console/SOAP layer before the module sees it, so
-multi-byte name handling can only be tested from a real client.
+Text *sent* through the console/SOAP layer is transcoded to a single-byte codepage before the
+module sees it, so anything outside it arrives as `?`. Measured 2026-09-04 by renaming a vault
+to `Тест Ünïcødé` over SOAP: it stored as `???? Ünïcødé` — the Latin-1 characters survived as
+correct two-byte UTF-8, the Cyrillic did not. So Latin-1 accented names *can* be driven from a
+harness; anything beyond that needs a real client. Text coming *back* is unaffected —
+`.vault info` prints a Cyrillic vault name correctly over SOAP.

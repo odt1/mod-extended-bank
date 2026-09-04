@@ -783,20 +783,44 @@ void ExtendedBankMgr::FlushAndDetachForLogout(Player* player)
 
 namespace
 {
-    // The game enforces these caps by counting what is in character_inventory, and a stowed
-    // vault is invisible to that count -- so a capped item parked in a vault would let its
-    // owner acquire another one.
+    // Two independent reasons an item may not live anywhere but the Main Vault, both of them
+    // the same shape: a stowed vault is invisible to a rule the game enforces elsewhere, so
+    // parking an item there would buy its owner something the game does not sell.
     //
-    // Written as the exact negation of the "no maximum" test in
-    // Player::CanTakeMoreSimilarItems (PlayerStorage.cpp:818), sentinel and all: there,
-    // MaxCount == 2147483647 means "no limit" even for an item that also carries an
-    // ItemLimitCategory, so a predicate that read the two conditions independently would evict
-    // an item the game does not in fact cap. No shipped template sits in that corner -- both
-    // forms select the same 5802 rows -- but a custom one could.
+    // 1. A capped item. The game enforces its cap by counting what is in character_inventory,
+    //    which a stowed vault is not part of, so a capped item parked in one would let its
+    //    owner acquire another.
+    //
+    //    Written as the exact negation of the "no maximum" test in
+    //    Player::CanTakeMoreSimilarItems (PlayerStorage.cpp:818), sentinel and all: there,
+    //    MaxCount == 2147483647 means "no limit" even for an item that also carries an
+    //    ItemLimitCategory, so a predicate that read the two conditions independently would
+    //    evict an item the game does not in fact cap. No shipped template sits in that corner
+    //    -- both forms select the same 5802 rows -- but a custom one could.
+    //
+    // 2. An item with a duration. Its clock is driven by Player::UpdateItemDuration over
+    //    m_itemDuration, and detaching a vault runs Player::RemoveItem, which calls
+    //    RemoveItemDurations -- so a stowed vault freezes the timer outright.
+    //
+    //    The tempting objection is that vanilla already pauses these: UpdateItemDuration is
+    //    called at login as UpdateItemDuration(time_diff, true) (PlayerStorage.cpp:5584), and
+    //    realtimeonly skips anything without ITEM_FLAGS_CU_DURATION_REAL_TIME, so an ordinary
+    //    duration item in the vanilla bank already stops ticking while its owner is logged
+    //    out. That misses what the two pauses cost. Vanilla's is paid for in playing time:
+    //    to stop the clock the player has to stop playing. A vault stops the same clock for
+    //    free, while they carry on. Same effect, no price -- which is the definition of the
+    //    thing this predicate exists to refuse, and it applies to every duration item, not
+    //    just the 70 real-time-flagged ones a narrower rule would have caught.
+    //
+    //    The template is authoritative rather than the live ITEM_FIELD_DURATION, because
+    //    Item::LoadFromDB forces the two into agreement anyway (Item.cpp:452).
     bool IsVaultRestricted(ItemTemplate const* proto)
     {
         if (!proto)
             return false;
+
+        if (proto->Duration != 0)
+            return true;
 
         if (proto->MaxCount == 2147483647)
             return false;

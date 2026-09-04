@@ -76,6 +76,7 @@ Lowering `MaxVaults` later never hides or deletes anything — characters keep e
 ## Important things to know
 
 - Because items in a custom vault are invisible to the game (various quest and special checks), this module **prohibits putting unique/quest/special bags and other one-of-a-kind items (basically anything with a maximum count or a limit category) into any vault EXCEPT the main one (your regular vanilla bank).** If you try to put such an item in, the module will reject it and put it straight back in your bags, with a message from the banker and a notification saying so. If your bags are full or you try to swap the items by dragging it on top of another item in a vault, it will be mailed to you instead. **Nothing is ever lost.** Your main bank is unaffected, so keep them there.
+- **Items with a time limit can only go in your main bank.** Holiday masks, brooms, conjured food, anything with a countdown — a custom vault would freeze the timer while you carry on playing, so they are refused the same way unique items are, and returned to your bags or mailed. Nothing is lost.
 - **`.pdump` does not carry vaults.** Dumping a character this way and loading it back loses vaults 2+.
 - **Faction and race changes do not convert items in vaults 2+.** Your main bank converts as usual.
 - **Playerbots always use Vault 1** and are otherwise unaffected.

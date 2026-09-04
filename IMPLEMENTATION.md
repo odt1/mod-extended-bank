@@ -448,16 +448,35 @@ the 480-byte name fits comfortably — the character count is the only thing 240
   `Player::GetItemByGuid`: once the module frees the item during a revert that resolves to
   `nullptr`, and every use site in `HandleAcceptTradeOpcode` is null-checked. The item silently
   drops out of the trade. No dangling pointer, no duplication.
-- **Items the game caps per character are not allowed in vaults 2..N.** `MaxCount` and
-  `ItemLimitCategory` are enforced by counting `character_inventory`, and a stowed vault is
-  invisible to that count — so parking a unique or quest item in a vault would let its owner
-  acquire another. Any such item found in a module-owned vault is moved back to the player's
-  bags with a message, or mailed if the bags are full. The check mirrors
+- **Two kinds of item are not allowed in vaults 2..N**, for the same underlying reason: a
+  stowed vault is invisible to a rule the game enforces elsewhere, so parking an item there
+  would buy its owner something the game does not sell. Either kind, found in a module-owned
+  vault, is moved back to the player's bags with a message, or mailed if the bags are full.
+  The check runs on every drain, so it also cleans out items stored before the rule existed,
+  the first time that vault is opened. The default vault is unaffected in both cases — it *is*
+  `character_inventory`, so the core's own accounting already sees it.
+
+  **Items the game caps per character.** `MaxCount` and `ItemLimitCategory` are enforced by
+  counting `character_inventory`, which a stowed vault is not part of, so parking a unique or
+  quest item in one would let its owner acquire another. The check mirrors
   `Player::CanTakeMoreSimilarItems` (`PlayerStorage.cpp:818`), including the `2147483647`
-  sentinel that means "no limit" despite being positive; it covers 5802 of the shipped item
-  templates. It runs on every drain, so it also cleans out items stored before the rule
-  existed, the first time that vault is opened. The default vault is unaffected — it *is*
-  `character_inventory`, so the core's own counting already sees it.
+  sentinel that means "no limit" despite being positive; it covers 5802 shipped templates.
+
+  **Items with a duration.** The clock is driven by `Player::UpdateItemDuration` walking
+  `m_itemDuration`, and detaching a vault calls `Player::RemoveItem`, which calls
+  `RemoveItemDurations` — so stowing a vault freezes its items' timers outright. The tempting
+  objection is that vanilla already pauses these: at login the catch-up is
+  `UpdateItemDuration(time_diff, true)` (`PlayerStorage.cpp:5584`), and `realtimeonly` skips
+  anything without `ITEM_FLAGS_CU_DURATION_REAL_TIME`, so an ordinary duration item in the
+  vanilla bank already stops ticking while its owner is logged out. That misses what the two
+  pauses cost. Vanilla's is paid for in playing time — to stop the clock you have to stop
+  playing. A vault stops the same clock for free while you carry on, and it does so for an
+  item the player can still reach at any banker. Same effect, no price, which is exactly what
+  this rule exists to refuse. It covers all 280 templates with a duration, not just the 70
+  real-time-flagged ones a narrower rule would have caught, because the free-pause argument
+  does not depend on the flag. The template is authoritative rather than the live
+  `ITEM_FIELD_DURATION`, since `Item::LoadFromDB` forces the two into agreement
+  (`Item.cpp:452`).
 - **A newly bought bank bag slot may not appear until the bank is reopened.** Seen several
   times while buying slots with a vault open: the frame kept showing the previous number, so
   after buying two slots it looked like one had been lost, and the final purchase left the last
