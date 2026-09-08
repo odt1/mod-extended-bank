@@ -57,6 +57,7 @@ enum class ExtendedBankSetting
     ENABLE,
     MAX_VAULTS,
     VAULT_COST,
+    ALLOW_RESTRICTED_ITEMS,
 
     NUM_CONFIGS
 };
@@ -69,6 +70,15 @@ public:
     void BuildConfigCache() override;
 
     [[nodiscard]] bool IsEnabled() const { return GetConfigValue<bool>(ExtendedBankSetting::ENABLE); }
+
+    // Whether the realm has switched off the rule that keeps capped and duration items out of
+    // vaults other than the default one. Off by default; the config file carries the argument
+    // for why, and what turning it on costs.
+    [[nodiscard]] bool AllowRestrictedItems() const
+    {
+        return GetConfigValue<bool>(ExtendedBankSetting::ALLOW_RESTRICTED_ITEMS);
+    }
+
     [[nodiscard]] uint8 GetMaxVaults() const
     {
         std::lock_guard<std::mutex> guard(_configMutex);

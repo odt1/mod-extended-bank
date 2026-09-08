@@ -534,6 +534,22 @@ number rather than the menu position — so moving one vault can never appear to
   does not depend on the flag. The template is authoritative rather than the live
   `ITEM_FIELD_DURATION`, since `Item::LoadFromDB` forces the two into agreement
   (`Item.cpp:452`).
+
+  **Both are refusable by the realm.** `ExtendedBank.AllowRestrictedItems`, off by default,
+  makes `IsVaultRestricted` return false for everything. Neither rule is a statement about how
+  the storage works — both are statements about what a realm treats as an exploit — so the
+  switch belongs to whoever runs it. The config file carries the argument in full, and the
+  module logs a warning naming the setting on every startup and every reload while it is on,
+  because a realm that has it on by accident has no other symptom. One line covers the whole
+  feature because nothing branches on *why* an item was refused: eviction, the flush fast path
+  and the bag-contents scan all ask the same predicate. Switching it back off needs no
+  migration either — the sweep that cleans out items stored before the rule existed is the same
+  sweep that cleans out items stored while it was off. Two things no switch can undo: a
+  duplicate created in the meantime, and one consequence that is not a balance question at all
+  — `Player::CanBankItem` calls `CanTakeMoreSimilarItems` unconditionally
+  (`PlayerStorage.cpp:2164`) and knows nothing of this setting, so a stowed unique whose owner
+  has since acquired a second copy cannot be placed when its vault is next opened, and takes
+  `AttachVault`'s mail-back path instead.
 - **A newly bought bank bag slot may not appear until the bank is reopened.** Seen several
   times while buying slots with a vault open: the frame kept showing the previous number, so
   after buying two slots it looked like one had been lost, and the final purchase left the last

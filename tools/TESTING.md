@@ -205,6 +205,34 @@ The section that matters most.
       buy. Refused with "your vaults were out of date", **no gold taken**, list reloads. *Proves
       the desync guard that previously ate the player's money.*
 
+## 5a. The restricted-item bypass
+
+`ExtendedBank.AllowRestrictedItems` (added 2026-09-09, default `0`) makes `IsVaultRestricted`
+return false for everything, so both the capped-item rule and the duration rule stop applying.
+Nothing else in the module branches on it. **Untested in game — the running build predates it.**
+
+- [ ] Default state. With the setting absent from the config file entirely, a unique item and a
+      duration item are both still refused from vault 2. *Proves the default is the old
+      behaviour and does not depend on the `.conf.dist` having been copied.*
+- [ ] Set it to `1` and `.reload config`: `Server.log` carries the warning naming the setting.
+      Remember `Logger.module=3` **and** `Appender.Server=2,3,...`, and that the reload
+      truncates the log before writing it.
+- [ ] With it on, drag a unique item and a duration item into vault 2. Both accepted, no
+      whisper, no chat line. Switch away and back: both still there.
+- [ ] `.vault check` and `tools/check_invariants.sql` stay clean with restricted items sitting
+      in a vault.
+- [ ] The freeze is real, and is what the setting buys: note a duration item's remaining time,
+      stow the vault for several minutes, reopen. The clock has not moved.
+- [ ] Set it back to `0` and reload **without** opening the vault. Nothing happens until that
+      vault is next opened; then both items are evicted to the bags with the usual notice, and
+      no vault row survives for either. *This is the "no migration needed" claim.*
+- [ ] The mail-back path the config file warns about. With the setting on, stow a unique item
+      in vault 2, `.additem` a second copy, then open vault 2. The stowed copy cannot be
+      placed — `Player::CanBankItem` calls `CanTakeMoreSimilarItems` unconditionally
+      (`PlayerStorage.cpp:2164`) and knows nothing of this setting — so it arrives by mail,
+      with `module.extendedbank` logging reason 17 (`EQUIP_ERR_CANT_CARRY_MORE_OF_THIS`) or the
+      limit-category equivalent. Confirm the item ends up in exactly one place.
+
 ## 6. Renaming
 
 - [x] `|cff00ff00Herbs|r` renders coloured in both menus and survives a relog.

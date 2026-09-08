@@ -79,14 +79,17 @@ Everything is hot-reloadable with `.reload config`; no restart needed.
 | `ExtendedBank.Enable` | `1` | Master switch. Set to `0` and bankers behave exactly like stock AzerothCore. |
 | `ExtendedBank.MaxVaults` | `8` | Vaults per character including Vault 1, so 7 to buy. Anything outside 1–20 is clamped. |
 | `ExtendedBank.VaultCost` | `"100,1000,2500,6000,18000,38000,90000"` | Price in **gold** for vault 2, 3, 4 … Last price is repeated if you have more vaults configured than listed here. |
+| `ExtendedBank.AllowRestrictedItems` | `0` | **Read the warning in the config file first.** Turns off the filter described in the first two points below, letting unique and time-limited items into vaults 2+. |
 
 Lowering `MaxVaults` later never hides or deletes anything — characters keep every vault they already own, they just cannot buy more.
+
+Turning `AllowRestrictedItems` back off again is safe and needs no cleanup: each vault hands its offending items back the next time it is opened. What it cannot undo is a duplicate that was created while it was on.
 
 
 ## Important things to know
 
-- **"Unique" items are blocked in custom vaults due to exploitation and game-breaking reasons (multiple soulstones/quest items/etc are possible otherwise).** Because items in a custom vault are invisible to the game (`Player::GetItemCount(..., inBankAlso)`, various quest and special checks), this module prohibits putting unique/quest/special and other one-of-a-kind items (basically anything with a `maxcount` or a limit category) into any vault EXCEPT the main one (your regular vanilla bank). If you try to put such an item in, the module will reject it and put it straight back in your bags, with a message from the banker and a notification saying so. If your bags are full or you try to swap the items by dragging it on top of another item in a vault, it will be mailed to you instead. **Nothing is ever lost.** Your main bank is unaffected, so keep them there.
-- **Items with a time limit can only go in your main bank.** Holiday items, conjured food, anything with a countdown — a custom vault would freeze the timer while you carry on playing, so they are refused the same way unique items are, and returned to your bags or mailed. Nothing is lost.
+- **"Unique" items are blocked in custom vaults due to exploitation and game-breaking reasons (multiple soulstones/quest items/etc are possible otherwise).** Because items in a custom vault are invisible to the game (`Player::GetItemCount(..., inBankAlso)`, various quest and special checks), this module prohibits putting unique/quest/special and other one-of-a-kind items (basically anything with a `maxcount` or a limit category) into any vault EXCEPT the main one (your regular vanilla bank). If you try to put such an item in, the module will reject it and put it straight back in your bags, with a message from the banker and a notification saying so. If your bags are full or you try to swap the items by dragging it on top of another item in a vault, it will be mailed to you instead. **Nothing is ever lost.** Your main bank is unaffected, so keep them there. A server operator can lift this with `ExtendedBank.AllowRestrictedItems`, which the config file spells out in full.
+- **Items with a time limit can only go in your main bank.** Holiday items, conjured food, anything with a countdown — a custom vault would freeze the timer while you carry on playing, so they are refused the same way unique items are, and returned to your bags or mailed. Nothing is lost. `ExtendedBank.AllowRestrictedItems` lifts this one too.
 - **`.pdump` does not carry vaults.** Dumping a character this way and loading it back loses vaults 2+.
 - **Faction and race changes do not convert items in vaults 2+.** Your main bank converts as usual.
 - **Playerbots always use Vault 1** and are otherwise unaffected.

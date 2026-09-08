@@ -787,6 +787,10 @@ namespace
     // the same shape: a stowed vault is invisible to a rule the game enforces elsewhere, so
     // parking an item there would buy its owner something the game does not sell.
     //
+    // Both are statements about what a realm considers an exploit rather than about how the
+    // storage works, so a realm is allowed to disagree with them -- see the bypass below and
+    // the disclaimer that comes with it in conf/mod_extended_bank.conf.dist.
+    //
     // 1. A capped item. The game enforces its cap by counting what is in character_inventory,
     //    which a stowed vault is not part of, so a capped item parked in one would let its
     //    owner acquire another.
@@ -817,6 +821,15 @@ namespace
     bool IsVaultRestricted(ItemTemplate const* proto)
     {
         if (!proto)
+            return false;
+
+        // The realm's override. One line is the whole of it because every caller asks this one
+        // question and nothing branches on *why* an item was refused. Switching it back off
+        // needs no migration either: FlushLiveVault re-asks for the live vault on the first
+        // tick after it is opened, so each vault hands its offending items back the next time
+        // it is used -- the same path items already in a vault took when this rule was first
+        // introduced. What it cannot undo is a duplicate the bypass allowed to exist.
+        if (sExtendedBankConfig.AllowRestrictedItems())
             return false;
 
         if (proto->Duration != 0)

@@ -22,6 +22,18 @@ void ExtendedBankConfig::BuildConfigCache()
     // copies the .conf.dist gets this list, and a mismatch silently reprices the feature.
     SetConfigValue<std::string>(ExtendedBankSetting::VAULT_COST, "ExtendedBank.VaultCost",
         "100,1000,2500,6000,18000,38000,90000");
+    SetConfigValue<bool>(ExtendedBankSetting::ALLOW_RESTRICTED_ITEMS, "ExtendedBank.AllowRestrictedItems", false);
+
+    // Said out loud on every startup and every reload, because it is the one setting here that
+    // changes what the realm's rules are rather than how the feature is priced or sized, and
+    // because a realm that has it on by accident has no other symptom to notice.
+    if (GetConfigValue<bool>(ExtendedBankSetting::ALLOW_RESTRICTED_ITEMS))
+    {
+        LOG_WARN("module.extendedbank",
+            "ExtendedBank.AllowRestrictedItems is enabled: capped and duration items may be stored in any vault. "
+            "A stowed vault is counted by nothing and ticks no clocks, so both caps and durations stop applying "
+            "to what is in one. See conf/mod_extended_bank.conf.dist.");
+    }
 
     uint32 const configuredMax = GetConfigValue<uint32>(ExtendedBankSetting::MAX_VAULTS);
     uint8 const maxVaults = static_cast<uint8>(std::clamp<uint32>(configuredMax, 1, EXTENDED_BANK_VAULT_LIMIT));

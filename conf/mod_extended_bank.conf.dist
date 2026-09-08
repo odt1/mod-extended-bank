@@ -50,3 +50,57 @@ ExtendedBank.MaxVaults = 8
 #
 
 ExtendedBank.VaultCost = "100,1000,2500,6000,18000,38000,90000"
+
+#
+#    ExtendedBank.AllowRestrictedItems
+#        Description: Removes the filter that keeps certain items out of every vault
+#                     except the Main one.
+#                     LEAVE THIS AT 0 UNLESS YOU HAVE READ WHAT FOLLOWS.
+#
+#                     By default a vault other than the Main one refuses two kinds of
+#                     item, and hands back anything of either kind already inside it:
+#
+#                       * Items the game caps per character - anything Unique, and
+#                         anything in a limit category such as "Unique-Equipped:
+#                         Jewelcrafter's Gems (3)".
+#                       * Items with a duration.
+#
+#                     Both refusals exist for one reason. A stowed vault is not part of
+#                     the character's inventory as far as the rest of the server is
+#                     concerned, so anything the server enforces by counting an
+#                     inventory, or by ticking a clock, stops applying to what is in
+#                     there:
+#
+#                       * A cap is enforced by counting the character's inventory, bank
+#                         included. A capped item parked in a stowed vault is not
+#                         counted, so its owner can go and acquire another one.
+#                       * A duration is ticked over the items a character has loaded,
+#                         and stowing a vault detaches its items, so the clock stops.
+#                         The item ages only while its vault is open. Vanilla pauses
+#                         these clocks too, but only while the character is logged out.
+#                         A vault gives the same pause for free, while the player
+#                         carries on playing.
+#
+#                     Setting this to 1 accepts both of those as the price of the
+#                     convenience. It also accepts one consequence that is not a
+#                     balance question at all:
+#
+#                       * A vault is opened by storing its items through the core's own
+#                         check, which does not know this setting exists and applies the
+#                         cap regardless. So if a character stows a Unique item and then
+#                         acquires a second copy, the stowed one cannot be placed when
+#                         that vault is next opened, and is MAILED BACK to its owner. It
+#                         is not destroyed, but it leaves the vault without being asked
+#                         to, and mail expires.
+#
+#                     Setting it back to 0 is safe and needs no cleanup: each vault
+#                     hands its offending items back the next time it is opened - to the
+#                     character's bags, or by mail if those are full.
+#
+#        Default:     0 - Refuse these items (recommended)
+#                     1 - Allow them, accepting everything above
+#
+#        Hot-reloadable with `.reload config`.
+#
+
+ExtendedBank.AllowRestrictedItems = 0
