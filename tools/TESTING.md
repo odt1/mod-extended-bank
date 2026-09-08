@@ -231,6 +231,41 @@ The section that matters most.
       side of both renames.
 - [x] Rename to an empty string: falls back to `Vault N`.
 
+## 6a. Reordering
+
+Presentation only — `sort_order` sets the menu order and nothing else, so none of these can
+touch an item. The point of testing it is to prove exactly that, and to catch an ordering bug
+that would look like a lost vault.
+
+- [x] **Adding the column to a realm whose database predates it.** Done 2026-09-08 by hand,
+      because the worldserver's re-run of the base file cannot add a column to a table that
+      already exists. `SHOW COLUMNS` reported `sort_order tinyint unsigned NOT NULL DEFAULT
+      255` in the right position, every pre-existing row kept 255 so the menu order was
+      unchanged, and no vault, item or bag-slot value moved. Only relevant to that one realm —
+      a fresh clone gets the column from the base schema — so the migration script was deleted
+      once it had run.
+- [ ] With four or more vaults, move the last one to the top one click at a time. The list
+      redraws in the new order each time, and the order survives a relog. *Proves
+      `PersistVaultOrder` writes and `LoadVaultList` reads the same thing.*
+- [ ] `Move "<name>" Up` is absent from the first two entries and present on every one below. *The
+      default vault is pinned and the second entry has only it above.*
+- [ ] Reorder **with a vault open**, then again in combat. Both work, and the open vault stays
+      open. *No guard applies, because no item is touched — this is the claim the whole design
+      of the feature rests on.*
+- [ ] After any amount of reordering, run `check_invariants.sql` and diff the bank half of
+      `character_inventory` against the §0 snapshot. Unchanged. *A move must be provably
+      incapable of touching storage.*
+- [ ] Buy a vault after reordering: it appears at the **bottom**, not the top. *`BuyNextVault`
+      writes 255, and a renumbered list holds 0..N-1.*
+- [ ] Rename a vault after moving it, and move a vault after renaming it. Neither disturbs the
+      other, and an unnamed vault keeps showing `Vault N` from its number rather than its
+      position.
+- [ ] `.vault move <vault> <name>` over SOAP reports the new order, and refuses with a distinct
+      message for a vault the character does not own and for one already at the top.
+- [ ] Set every row's `sort_order` to the same value by hand, then open the menu: the order
+      falls back to the vault number rather than being arbitrary. *`GetOwnedVaults` sorts on
+      `(sort_order, vault)` so ties are still a total order.*
+
 ## 7. Lifecycle
 
 - [x] Open vault 2, walk out of range. Within ~1s the live bank is vault 1 again — verify from a
@@ -562,7 +597,8 @@ Two genuine exceptions were found by that sweep and are listed separately: the t
       bool and the command prints `<name> does not own vault N. Nothing was written.` The
       gossip path discards that return on purpose — its menu only lists owned vaults, so a
       false there means a forged action and redrawing the menu is the right answer.
-      - [ ] Retest after the next build: `.vault rename <name> 9 Foo` prints the refusal.
+      - [x] Verified 2026-09-08: `.vault rename <name> 9 Foo` answers
+            `<name> does not own vault 9. Nothing was written.` and creates no row.
 - [ ] `CMSG_BANKER_ACTIVATE` for a creature that is not a banker, and for one out of range.
 - [x] Vault switches spammed as fast as the client will send them.
 
@@ -624,6 +660,76 @@ Everything else is meant to be behaviour-identical, so the quickest confidence c
       instrumented-build test rather than a client one; listed because the failure is silent
       (a `_SaveInventory` complaint per save, and a once-a-second walk over an item that now
       lives in the mail).
+
+## Unreproduced report: blank bank item slots on the first banker visit of a session
+
+**Seen once, on 2026-09-05, and not since.** Hours of ordinary play afterwards have not produced
+it again, and no attempt was made to reproduce it deliberately, so everything below is a
+hypothesis built on a single observation. In particular **the attribution to ElvUI is an
+assumption, not a finding** — it is the client that was running, and its bag code has a shape
+that would explain the symptom, which is a long way from evidence that it caused it.
+
+Kept because the reasoning cost something to work out and the next occurrence should not have
+to start from nothing. It is not a known bug and should not be described as one.
+
+What was observed: opening the Main Vault as the **first banker interaction of the session**
+drew all 28 top-level bank slots empty, while the bank bags and everything inside them were
+correct. Switching to another vault and back fixed it for the rest of the session. The
+character had not opened any vault beforehand and had been standing at the banker for hours.
+
+Nothing is wrong server-side. `character_inventory` held all 25 occupied item slots and all 7
+bank bags, the vault's own rows were intact and separate, `check_invariants.sql` passed, and
+`Errors.log` contained no module line — no aborted flush, no failed statement. This is a
+drawing fault, not a storage one.
+
+What has been established, and what it rules out:
+
+- **The stock UI cannot produce this asymmetry.** `BankFrame_OnShow` (`FrameXML/BankFrame.lua`)
+  updates the 28 item buttons and the 7 bag buttons in one function, back to back, and
+  `PLAYERBANKSLOTS_CHANGED` routes both to the same `BankFrameItemButton_Update`. It also reads
+  `GetInventoryItemTexture("player", inventoryID)` — inventory slots, not containers.
+- **ElvUI splits them, and only rescans everything once per session.** `B:OpenBank`
+  (`ElvUI/Core/Modules/Bags/Bags.lua`) calls `B:UpdateAllSlots(frame, true)` only under
+  `if B.BankFrame.firstOpen`, and afterwards relies on `staleBags`/`staleSlots`. That matches
+  the report exactly: the first open is the only one that takes the full-scan path, and a later
+  vault switch repairs it because it fires `PLAYERBANKSLOTS_CHANGED` for every slot.
+- **Two tempting explanations are dead.** `GetContainerNumSlots(BANK_CONTAINER)` is a hardcoded
+  constant in the client — the decomp shows index -1 taking a fixed-double branch with no
+  bank-state check — so ElvUI's `for slotID = 1, slotMax` always runs 28 times. And `B.BankTab`
+  is never initialised, so on a first open `previousTab` is nil, `nil ~= 1`, and `B:Layout(true)`
+  does run and create the slot frames that `B:UpdateSlot` would otherwise early-return on.
+
+The most plausible mechanism, wholly untested: Blizzard's own handler self-closes the bank when the panel
+manager refuses it —
+
+```lua
+ShowUIPanel(self);
+if ( not self:IsShown() ) then CloseBankFrame(); end
+```
+
+— so a failed `ShowUIPanel` leaves any later-registered handler scanning a bank the client no
+longer considers open, and `firstOpen` is consumed regardless. The module's only wire-level
+difference from a stock banker on this path is that `OpenVault` sends `SMSG_GOSSIP_COMPLETE`
+immediately before `SMSG_SHOW_BANK`, where vanilla sends only the latter and lets the client
+close the gossip frame itself. That is `SendCloseGossip()`, already carrying the comment
+"Precautionary, NOT a verified fix" — it was added for the earlier stale bag-slot-count
+anomaly, seen when "a bank frame opened behind a closing gossip frame", which was never
+reproduced either. Same signature, same suspect.
+
+Nothing here is scheduled work. If it ever happens again, this is the order to take it in:
+
+1. Reproduce it: fresh login, first banker interaction of the session, Main Vault. Everything
+   below is worthless without that, and a fault seen once in hours of play may not be
+   deterministic at all.
+2. Repeat with ElvUI disabled. The FrameXML reading above says the stock UI should be immune;
+   if it is not, this analysis is wrong and the cause is server-side.
+3. Only then A/B the suspect: remove `SendCloseGossip()` from `OpenVault`, rebuild, repeat.
+   Removing it restores the exact vanilla packet sequence for opening a bank.
+
+Note the trap in step 3. `SendCloseGossip()` was itself added speculatively, for the stale
+bag-slot-count anomaly that was never reproduced either. Removing one unverified fix to chase
+one unreproduced fault would leave two guesses stacked on each other, which is why the repro
+comes first and why nothing has been changed on the strength of this report.
 
 ## What is left
 

@@ -32,9 +32,10 @@ namespace
     {
         EXTENDED_BANK_ACTION_OPEN_BASE   = 1000,
         EXTENDED_BANK_ACTION_RENAME_BASE = 2000,
-        EXTENDED_BANK_ACTION_BUY         = 3000,
-        EXTENDED_BANK_ACTION_RENAME_MENU = 3001,
-        EXTENDED_BANK_ACTION_MAIN_MENU   = 3002
+        EXTENDED_BANK_ACTION_MOVE_BASE   = 3000,
+        EXTENDED_BANK_ACTION_BUY         = 4000,
+        EXTENDED_BANK_ACTION_MANAGE_MENU = 4001,
+        EXTENDED_BANK_ACTION_MAIN_MENU   = 4002
     };
 
     // A core-built option carried across the menu rebuild, with its sub-menu link.
@@ -153,8 +154,8 @@ namespace
         // no reason the option should appear only after a purchase.
         if (CanAddMenuItem(player))
         {
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Rename Vaults",
-                EXTENDED_BANK_SENDER, EXTENDED_BANK_ACTION_RENAME_MENU);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Rename and Reorder Vaults",
+                EXTENDED_BANK_SENDER, EXTENDED_BANK_ACTION_MANAGE_MENU);
         }
 
         // Re-add the NPC's own options below the vault list, keeping their sub-menu links.
@@ -184,26 +185,45 @@ namespace
         return true;
     }
 
-    void SendRenameMenu(Player* player, Creature* creature)
+    // Renaming and reordering share one menu because they are the two things a player does to
+    // a vault rather than to its contents, and because the move entry has to sit next to the
+    // name it moves to be readable. They are otherwise unrelated: a move never touches a name
+    // and a rename never touches a position.
+    void SendManageMenu(Player* player, Creature* creature)
     {
         ObjectGuid const playerGuid = player->GetGUID();
         std::vector<uint8> const owned = sExtendedBankMgr->GetOwnedVaults(playerGuid);
 
         ClearGossipMenuFor(player);
 
-        for (uint8 vault : owned)
+        for (std::size_t index = 0; index < owned.size(); ++index)
         {
-            // One slot held back for "Back". A rename list the player cannot leave would be
-            // worse than one that is short a vault. Unreachable at a vault limit of 20, and
-            // free.
+            uint8 const vault = owned[index];
+
+            // One slot held back for "Back". A list the player cannot leave would be worse
+            // than one that is short a vault. Unreachable at a vault limit of 20, and free.
             if (!CanAddMenuItem(player, 1))
                 break;
 
             std::string const name = sExtendedBankMgr->GetVaultName(playerGuid, vault);
 
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, name,
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT,
+                Acore::StringFormat("Rename \"{}\"", name),
                 EXTENDED_BANK_SENDER, EXTENDED_BANK_ACTION_RENAME_BASE + vault,
                 Acore::StringFormat("Enter a new name for {}:", name), 0, true);
+
+            // Index 0 is the pinned default vault and index 1 sits directly below it, so
+            // neither has anywhere to go. Offering the option only where it does something is
+            // what keeps the top of the list from carrying a line that silently fails.
+            if (index < 2)
+                continue;
+
+            if (!CanAddMenuItem(player, 1))
+                break;
+
+            AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1,
+                Acore::StringFormat("Move \"{}\" Up", name),
+                EXTENDED_BANK_SENDER, EXTENDED_BANK_ACTION_MOVE_BASE + vault);
         }
 
         AddGossipItemFor(player, GOSSIP_ICON_TALK, "Back",
@@ -247,6 +267,19 @@ public:
             return true;
         }
 
+        if (action > EXTENDED_BANK_ACTION_MOVE_BASE && action < EXTENDED_BANK_ACTION_BUY)
+        {
+            uint8 const vault = static_cast<uint8>(action - EXTENDED_BANK_ACTION_MOVE_BASE);
+
+            // The return value is discarded for the same reason RenameVault's is: this menu
+            // only offers the option where it does something, so a false means a forged
+            // action against a call that has already declined to write anything. Redrawing
+            // shows the new order either way.
+            sExtendedBankMgr->MoveVaultUp(player, vault);
+            SendManageMenu(player, creature);
+            return true;
+        }
+
         switch (action)
         {
             // A refusal here can only mean the player stopped meeting the banker option's
@@ -258,8 +291,8 @@ public:
                 if (!SendMainMenu(player, creature))
                     CloseGossipMenuFor(player);
                 break;
-            case EXTENDED_BANK_ACTION_RENAME_MENU:
-                SendRenameMenu(player, creature);
+            case EXTENDED_BANK_ACTION_MANAGE_MENU:
+                SendManageMenu(player, creature);
                 break;
             case EXTENDED_BANK_ACTION_MAIN_MENU:
                 if (!SendMainMenu(player, creature))
@@ -279,7 +312,7 @@ public:
         if (!sExtendedBankConfig.IsEnabled() || sender != EXTENDED_BANK_SENDER)
             return false;
 
-        if (action > EXTENDED_BANK_ACTION_RENAME_BASE && action < EXTENDED_BANK_ACTION_BUY)
+        if (action > EXTENDED_BANK_ACTION_RENAME_BASE && action < EXTENDED_BANK_ACTION_MOVE_BASE)
         {
             uint8 const vault = static_cast<uint8>(action - EXTENDED_BANK_ACTION_RENAME_BASE);
 
@@ -287,7 +320,7 @@ public:
             // character owns, so a false here means a forged action, and RenameVault has
             // already declined to write anything. Redrawing the menu is the right answer.
             sExtendedBankMgr->RenameVault(player, vault, code ? code : "");
-            SendRenameMenu(player, creature);
+            SendManageMenu(player, creature);
             return true;
         }
 

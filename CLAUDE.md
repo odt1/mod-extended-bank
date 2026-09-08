@@ -34,7 +34,7 @@ through core helpers: `Item::DeleteFromInventoryDB` for an item taken *into* a v
 
 The split between the two storage files runs along that invariant: `ExtendedBankStorage.cpp`
 decides which table an item belongs to and is the only file that constructs, places or frees
-an `Item`; `ExtendedBankVaults.cpp` only ever reads, names, buys or renames one.
+an `Item`; `ExtendedBankVaults.cpp` only ever reads, names, orders, buys or renames one.
 
 `SelfHealVaultRows` is the single crossing, and the insurance: at login it drops any vault row whose item has turned up
 somewhere the core owns — `character_inventory`, `mail_items`, `auctionhouse` or
@@ -106,6 +106,27 @@ Other landmines, each already paid for once:
   all three are load-bearing — the format string stays a literal so the name is only ever an
   fmt argument, the value stays inside single quotes, and nothing else in the module
   interpolates player-supplied text into SQL.
+- **Module SQL files are ordered by bare filename across the whole tree, directories ignored.**
+  `UpdateFetcher::FillFileListRecursively` flattens `base/` and `updates/` into one
+  `std::set`, and `PathCompare` compares `filename()` alone. So a file in `updates/` whose name
+  sorts before the one in `base/` runs *first*, and on a fresh install an `ALTER` would execute
+  against a table that does not exist yet. Duplicate filenames anywhere in the realm's update
+  set are a `LOG_FATAL`. Editing an already-applied file is fine and is the simpler option
+  while the module is unpublished: the hash changes and the fetcher logs
+  `>> Reapplying update ... (it changed)` (`UpdateFetcher.cpp:351`). What that re-run cannot do
+  is **add a column**, because the statement is `CREATE TABLE IF NOT EXISTS` and the table
+  already exists. That gap only matters for a realm whose database predates the change; a fresh
+  clone gets the whole schema from the base file. The one realm in that position was migrated
+  by hand on 2026-09-08 when `sort_order` was added, and the throwaway `ALTER` was deleted
+  afterwards rather than kept as a permanent instruction nobody needs.
+- **`mod_extended_bank_vaults.sort_order` is presentation only.** It sets the order the gossip
+  menu lists vaults in and nothing else. It never identifies a vault, never appears in
+  `mod_extended_bank_vault_items`, and no value of it can move an item — which is why
+  reordering needs none of the guards a vault switch does and works with a vault open, in
+  combat or mid-trade. `PersistVaultOrder` renumbers the whole list from zero on every move
+  rather than swapping a pair, so duplicates, gaps and the 255 default all resolve themselves;
+  the column deliberately has no unique key, so a half-applied write still leaves a valid
+  ordering.
 - **Optimistic bookkeeping: the module records what it *sent*, not what committed.**
   `CaptureLayout` and `SyncVaultBagSlots` update their in-memory state immediately after
   `CommitTransaction`, which is asynchronous and reports nothing back. If that transaction
@@ -126,12 +147,13 @@ Other landmines, each already paid for once:
 |---|---|
 | `src/ExtendedBank.h` | constants, config cache, `ExtendedBankMgr` |
 | `src/ExtendedBankStorage.cpp` | attach/detach/flush and every item write — the invariant lives here |
-| `src/ExtendedBankVaults.cpp` | `mod_extended_bank_vaults`: the metadata list, queries, buy, rename, login |
+| `src/ExtendedBankVaults.cpp` | `mod_extended_bank_vaults`: the metadata list, queries, buy, rename, reorder, login |
 | `src/ExtendedBankGossip.cpp` | `AllCreatureScript` menu + the `ServerScript` packet hook |
 | `src/ExtendedBankPlayer.cpp` | `PlayerScript` lifecycle hooks |
 | `src/ExtendedBankConfig.cpp` | `ConfigValueCache` + `WorldScript` |
 | `src/ExtendedBankCommands.cpp` | `.vault` debug commands, all `Console::Yes` |
 | `tools/check_invariants.sql` | 11 read-only DB checks; zero rows = healthy |
+| `tools/logo.py` | regenerates `images/logo.png`; reads an extracted client, so it needs local MPQ paths |
 
 Two entry points reach the gossip menu, and both must keep working: bankers *with*
 `UNIT_NPC_FLAG_GOSSIP` arrive via `CanCreatureGossipHello`; the majority, which lack it, send
@@ -181,7 +203,8 @@ Requirements/mysqlbin/mysql -h127.0.0.1 -uacore -pacore acore_characters < tools
 With SOAP enabled (`SOAP.Enabled = 1`, 127.0.0.1:7878), GM commands can be driven from a
 script: POST a `<ns1:executeCommand><command>…</command></ns1:executeCommand>` envelope with
 HTTP basic auth. That plus the `.vault` subcommands — `info`, `check`, `open`, `revert`,
-`flush`, `buy`, `rename` — makes most of the plan runnable without a game client. `.vault open`
+`flush`, `buy`, `rename`, `move` — makes most of the plan runnable without a game client.
+`.vault open`
 uses the player's own GUID as the banker, the GM `.bank` convention that
 `WorldSession::CanUseBank` special-cases, so a vault opened that way stays loaded.
 

@@ -1,14 +1,24 @@
+<p align="center">
+  <img src="images/logo.png" alt="Extended Bank" width="600">
+</p>
+
 # mod-extended-bank
 
 Balanced bank space extension module that adds new vanilla-like bank pages or **vaults**.
 
 No client addon, no custom frame, no client patch: right-click any banker, buy and pick a vault page from the new dialogue window and the ordinary bank UI opens showing that vault's contents.
 
-- **7 new vaults**, bought from the banker's new dialogue window, priced *very* steeply as a gold sink and for balance reasons.
-- Each vault has the usual 28 item slots and its own 7 purchasable bank bag slots, bought through the vanilla bank UI.
+- **7+ new vaults**, bought and used from the banker's new dialogue window, priced *very* steeply by default as a gold sink and for balance reasons.
+- Each vault works exactly the same as regular bank, has the usual 28 item slots and its own 7 purchasable bag slots, bought through the vanilla bank UI.
 - **Vault 1 is your normal bank.** The module never touches its storage. Turn the module off and your vanilla bank is exactly as it was.
-- Vaults can be renamed, with support for colour codes and inline icons if you like.
-- Heavily tested for data safety in edge cases, including hard client *and* server crashes mid-write. But there is always room for improvement, especially for multiplayer scenarios — issue reports are welcome!
+- Vaults can be renamed, with support for colour codes and inline icons.
+- Heavily tested for data safety in edge cases, including hard client *and* server crashes mid-write. But there is always room for improvement, especially in multiplayer and exploitation scenarios — issue reports are welcome!
+
+<p align="center">
+  <img src="images/in-game.png" alt="A banker's gossip window listing Main Vault, Gear, Tools and Vanity, with options to buy the next vault and to rename and reorder them" width="340">
+  <br>
+  <em>Four banks, three of them renamed and reordered, on a stock client with no addon.</em>
+</p>
 
 ## Disclaimer
 
@@ -34,17 +44,17 @@ The core picks up `data/sql/` on its own and the two database tables are created
 
 Right-click any banker and pick a vault from the list, then use it as your new regular bank. This works on every banker in the game.
 
-**Buy a vault.** `Buy Next Vault` in the same menu. You get a confirmation box with the price.
+**Buying a vault:** `Buy Next Vault` in the same menu. You get a confirmation box with the price.
 
-**Buy bank bag slots.** Open the vault first, then use the normal purchase button in the bank frame. Each vault has its own count, so a new one starts with none even if your main bank is full of them.
+**Buying bank bag slots:** Each vault has its own count so open the vault first, then use the normal purchase button in the bank frame.
 
-### Rename a vault
+**Renaming a vault or reordering their positions:** Use the `Rename and Reorder Vaults` sub-menu to reorder the list (your Main Vault always stays at the top) or rename any vault.
 
-`Rename Vaults`, pick one, type a name. Colour codes and icons both work.
+Colour codes and icons both work.
 
 You can use [this article](https://wowpedia.fandom.com/wiki/UI_escape_sequences) to familiarize yourself with WoW text escape sequences. And [WoWHead](https://www.wowhead.com/wotlk/icons) (or extracted MPQs) to find the icon names.
 
-#### Colours
+- Colours:
 
 ```
 |cff33ff00your_vault_name_here|r
@@ -53,12 +63,12 @@ You can use [this article](https://wowpedia.fandom.com/wiki/UI_escape_sequences)
 `|cff` opens, `|r` closes, and the six characters between them are an ordinary **RRGGBB** hex
 colour — `33` red, `ff` green, `00` blue for the bright green above.
 
-#### Icons
+- Icons:
 
 ```
 |TInterface\Icons\INV_Misc_Bag_08:16|t Bags
 ```
-Supports both icon name and size.
+Supports both icon name (`INV_Misc_Bag_08`) and size (`16`).
 
 ## Configuration
 
@@ -68,20 +78,20 @@ Everything is hot-reloadable with `.reload config`; no restart needed.
 |---|---|---|
 | `ExtendedBank.Enable` | `1` | Master switch. Set to `0` and bankers behave exactly like stock AzerothCore. |
 | `ExtendedBank.MaxVaults` | `8` | Vaults per character including Vault 1, so 7 to buy. Anything outside 1–20 is clamped. |
-| `ExtendedBank.VaultCost` | `"100,1000,2500,6000,18000,38000,90000"` | Price in **gold** for vault 2, 3, 4 … A shorter list repeats its last price for the rest. |
+| `ExtendedBank.VaultCost` | `"100,1000,2500,6000,18000,38000,90000"` | Price in **gold** for vault 2, 3, 4 … Last price is repeated if you have more vaults configured than listed here. |
 
 Lowering `MaxVaults` later never hides or deletes anything — characters keep every vault they already own, they just cannot buy more.
 
 
 ## Important things to know
 
-- Because items in a custom vault are invisible to the game (various quest and special checks), this module **prohibits putting unique/quest/special bags and other one-of-a-kind items (basically anything with a maximum count or a limit category) into any vault EXCEPT the main one (your regular vanilla bank).** If you try to put such an item in, the module will reject it and put it straight back in your bags, with a message from the banker and a notification saying so. If your bags are full or you try to swap the items by dragging it on top of another item in a vault, it will be mailed to you instead. **Nothing is ever lost.** Your main bank is unaffected, so keep them there.
-- **Items with a time limit can only go in your main bank.** Holiday masks, brooms, conjured food, anything with a countdown — a custom vault would freeze the timer while you carry on playing, so they are refused the same way unique items are, and returned to your bags or mailed. Nothing is lost.
+- **"Unique" items are blocked in custom vaults due to exploitation and game-breaking reasons (multiple soulstones/quest items/etc are possible otherwise).** Because items in a custom vault are invisible to the game (`Player::GetItemCount(..., inBankAlso)`, various quest and special checks), this module prohibits putting unique/quest/special and other one-of-a-kind items (basically anything with a `maxcount` or a limit category) into any vault EXCEPT the main one (your regular vanilla bank). If you try to put such an item in, the module will reject it and put it straight back in your bags, with a message from the banker and a notification saying so. If your bags are full or you try to swap the items by dragging it on top of another item in a vault, it will be mailed to you instead. **Nothing is ever lost.** Your main bank is unaffected, so keep them there.
+- **Items with a time limit can only go in your main bank.** Holiday items, conjured food, anything with a countdown — a custom vault would freeze the timer while you carry on playing, so they are refused the same way unique items are, and returned to your bags or mailed. Nothing is lost.
 - **`.pdump` does not carry vaults.** Dumping a character this way and loading it back loses vaults 2+.
 - **Faction and race changes do not convert items in vaults 2+.** Your main bank converts as usual.
 - **Playerbots always use Vault 1** and are otherwise unaffected.
 - **Non-Latin vault names may show as `?` on an English client using default Blizzard UI and Fonts.** Cyrillic, CJK and other non-Latin names are stored and sent correctly, but the vault list and the rename menu will render a `?`. A UI that replaces the game fonts, such as ElvUI, displays them correctly.
-- **ElvUI users:** ElvUI stops showing the bank bag slot purchase button once your main bank has bought all seven, and will not show it again in a vault that has fewer. This is an ElvUI problem — the default Blizzard bank frame handles it correctly — and `/run PurchaseSlot()` works as a complete substitute.
+- **ElvUI users:** ElvUI stops showing the bank bag slot purchase button once your main bank has bought all seven, and will not show it again in a vault that has fewer. This is an ElvUI problem — the default Blizzard bank frame handles it correctly — and `/run PurchaseSlot()` works as a complete substitute. There seems to be other minor cosmetic issues with ElvUI specifically, like a very random chance of some bank slots showing empty, reopening the storage fixes it.
 
 ## Uninstalling
 

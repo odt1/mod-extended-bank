@@ -37,8 +37,12 @@ void ExtendedBankMgr::LoadVaultList(ObjectGuid playerGuid)
 
     _vaults.erase(playerGuid);
 
+    // Ordered by sort_order first so the list arrives in menu order, with vault as the
+    // tiebreak -- which is the whole ordering on a realm where nobody has reordered anything,
+    // since every row then still carries the default.
     QueryResult result = CharacterDatabase.Query(
-        "SELECT vault, name, bag_slots FROM mod_extended_bank_vaults WHERE owner_guid = {} ORDER BY vault",
+        "SELECT vault, name, bag_slots, sort_order FROM mod_extended_bank_vaults "
+        "WHERE owner_guid = {} ORDER BY sort_order, vault",
         playerGuid.GetCounter());
 
     if (!result)
@@ -54,6 +58,7 @@ void ExtendedBankMgr::LoadVaultList(ObjectGuid playerGuid)
         vault.Vault = fields[0].Get<uint8>();
         vault.Name = fields[1].Get<std::string>();
         vault.BagSlots = fields[2].Get<uint8>();
+        vault.SortOrder = fields[3].Get<uint8>();
 
         vaults.push_back(std::move(vault));
     } while (result->NextRow());
@@ -153,17 +158,38 @@ std::vector<uint8> ExtendedBankMgr::GetOwnedVaults(ObjectGuid playerGuid) const
 {
     std::lock_guard<std::recursive_mutex> guard(_mutex);
 
+    // The default vault is pinned to the front rather than sorted there. It *is*
+    // `character_inventory` and the resting state of the bank, so a fixed anchor is worth more
+    // than the freedom to bury it, and pinning it means its own sort_order can never matter.
     std::vector<uint8> owned{ EXTENDED_BANK_DEFAULT_VAULT };
 
     auto const itr = _vaults.find(playerGuid);
-    if (itr != _vaults.end())
-        for (ExtendedBankVault const& entry : itr->second)
-            if (entry.Vault != EXTENDED_BANK_DEFAULT_VAULT)
-                owned.push_back(entry.Vault);
+    if (itr == _vaults.end())
+        return owned;
 
-    // LoadVaultList reads in vault order, but BuyNextVault and EnsureDefaultVaultRow append to
-    // the live list, so it is only sorted by construction until one of those runs.
-    std::sort(owned.begin(), owned.end());
+    std::vector<ExtendedBankVault const*> rest;
+    rest.reserve(itr->second.size());
+
+    for (ExtendedBankVault const& entry : itr->second)
+        if (entry.Vault != EXTENDED_BANK_DEFAULT_VAULT)
+            rest.push_back(&entry);
+
+    // LoadVaultList reads in menu order, but BuyNextVault and EnsureDefaultVaultRow append to
+    // the live list, so it is only ordered by construction until one of those runs. Sorting on
+    // the vault number as well as the position keeps the result total: two vaults sharing a
+    // position -- every vault, before anything is ever moved -- still have a defined order.
+    std::sort(rest.begin(), rest.end(),
+        [](ExtendedBankVault const* left, ExtendedBankVault const* right)
+        {
+            if (left->SortOrder != right->SortOrder)
+                return left->SortOrder < right->SortOrder;
+
+            return left->Vault < right->Vault;
+        });
+
+    for (ExtendedBankVault const* entry : rest)
+        owned.push_back(entry->Vault);
+
     return owned;
 }
 
@@ -397,15 +423,16 @@ bool ExtendedBankMgr::BuyNextVault(Player* player)
     ExtendedBankVault vault;
     vault.Vault = next;
     vault.BagSlots = 0;
+    vault.SortOrder = EXTENDED_BANK_SORT_LAST;
 
     // A no-op on collision rather than a plain INSERT. The check above rules a collision out
     // on a healthy realm, and a statement that aborts would take the rest of its async batch
     // down with it over a row that already says exactly what was wanted.
     CharacterDatabase.Execute(
-        "INSERT INTO mod_extended_bank_vaults (owner_guid, vault, name, bag_slots, created) "
-        "VALUES ({}, {}, '', 0, UNIX_TIMESTAMP()) "
+        "INSERT INTO mod_extended_bank_vaults (owner_guid, vault, name, bag_slots, sort_order, created) "
+        "VALUES ({}, {}, '', 0, {}, UNIX_TIMESTAMP()) "
         "ON DUPLICATE KEY UPDATE vault = VALUES(vault)",
-        playerGuid.GetCounter(), next);
+        playerGuid.GetCounter(), next, uint32(EXTENDED_BANK_SORT_LAST));
 
     _vaults[playerGuid].push_back(std::move(vault));
 
@@ -465,5 +492,59 @@ bool ExtendedBankMgr::RenameVault(Player* player, uint8 vault, std::string const
     // turned an over-length rename into a broken gossip window that survived the failed
     // UPDATE: the menu kept re-sending a name the database had rejected.
     meta->Name = std::move(stored);
+    return true;
+}
+
+void ExtendedBankMgr::PersistVaultOrder(ObjectGuid playerGuid, std::vector<uint8> const& order)
+{
+    std::lock_guard<std::recursive_mutex> guard(_mutex);
+
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+    for (std::size_t index = 0; index < order.size(); ++index)
+    {
+        // Positions are assigned from zero rather than swapped, so the stored values are
+        // always a clean 0..N-1 afterwards. There is no unique key on the column and ties
+        // break on the vault number, so even a half-applied result stays a valid ordering --
+        // which is what makes this safe to write optimistically, the way every other cache in
+        // this file is.
+        uint8 const position = static_cast<uint8>(std::min<std::size_t>(index, EXTENDED_BANK_SORT_LAST));
+
+        if (ExtendedBankVault* meta = FindVault(playerGuid, order[index]))
+            meta->SortOrder = position;
+
+        trans->Append("UPDATE mod_extended_bank_vaults SET sort_order = {} WHERE owner_guid = {} AND vault = {}",
+            position, playerGuid.GetCounter(), order[index]);
+    }
+
+    CharacterDatabase.CommitTransaction(trans);
+}
+
+bool ExtendedBankMgr::MoveVaultUp(Player* player, uint8 vault)
+{
+    std::lock_guard<std::recursive_mutex> guard(_mutex);
+
+    ObjectGuid const playerGuid = player->GetGUID();
+
+    // The default vault is pinned to the front of the menu, so there is nowhere for it to go.
+    if (vault == EXTENDED_BANK_DEFAULT_VAULT)
+        return false;
+
+    std::vector<uint8> order = GetOwnedVaults(playerGuid);
+
+    auto const position = std::find(order.begin(), order.end(), vault);
+    if (position == order.end())
+        return false;
+
+    // Index 0 is the pinned default vault and index 1 sits directly below it, so neither has a
+    // vault above it that this may pass. Refusing here rather than silently doing nothing is
+    // what lets the caller tell "already at the top" from "does not own it".
+    std::size_t const index = static_cast<std::size_t>(std::distance(order.begin(), position));
+    if (index < 2)
+        return false;
+
+    std::swap(order[index - 1], order[index]);
+
+    PersistVaultOrder(playerGuid, order);
     return true;
 }

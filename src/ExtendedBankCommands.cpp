@@ -327,6 +327,36 @@ namespace
     // The target is required and comes first: Tail has to be the last parameter, which leaves
     // nowhere unambiguous to put an optional name -- it would swallow the first word of the
     // new vault name instead.
+    // Reordering has no client-driven route a harness can reach -- it is a gossip click -- so
+    // this exists to make the menu order testable over SOAP alongside everything else.
+    bool HandleVaultMoveCommand(ChatHandler* handler, uint8 vault, Optional<PlayerIdentifier> target)
+    {
+        Player* player = ResolveTarget(handler, target);
+        if (!player)
+            return true;
+
+        if (!sExtendedBankMgr->MoveVaultUp(player, vault))
+        {
+            handler->PSendSysMessage(
+                "Vault {} was not moved: {} does not own it, or it is already as high as it can go.",
+                vault, player->GetName());
+            return true;
+        }
+
+        std::string order;
+
+        for (uint8 owned : sExtendedBankMgr->GetOwnedVaults(player->GetGUID()))
+        {
+            if (!order.empty())
+                order += ", ";
+
+            order += std::to_string(owned);
+        }
+
+        handler->PSendSysMessage("Vault {} moved up. Menu order is now: {}", vault, order);
+        return true;
+    }
+
     bool HandleVaultRenameCommand(ChatHandler* handler, PlayerIdentifier target, uint8 vault, Tail name)
     {
         Player* player = ResolveTarget(handler, target);
@@ -366,6 +396,7 @@ public:
             { "flush",  HandleVaultFlushCommand,  SEC_ADMINISTRATOR, Console::Yes },
             { "buy",    HandleVaultBuyCommand,    SEC_ADMINISTRATOR, Console::Yes },
             { "rename", HandleVaultRenameCommand, SEC_ADMINISTRATOR, Console::Yes },
+            { "move",   HandleVaultMoveCommand,   SEC_ADMINISTRATOR, Console::Yes },
         };
 
         static std::vector<ChatCommandBuilder> commandTable =

@@ -300,7 +300,7 @@ With nothing bought:
 ```
 Main Vault
 Buy Next Vault (100 gold)
-Rename Vaults
+Rename and Reorder Vaults
 ```
 
 After buying one:
@@ -309,7 +309,7 @@ After buying one:
 Main Vault
 Vault 2
 Buy Next Vault (1000 gold)
-Rename Vaults
+Rename and Reorder Vaults
 ```
 
 Because vault 1 is listed as its own entry, the core-generated banker option would be a
@@ -352,8 +352,10 @@ paths call the same menu builder.
 
 ## Renaming
 
-`Rename Vaults` lists every owned vault, including vault 1 (whose name is only a label — it
-changes nothing about its storage). Clicking one opens the client's gossip text box.
+`Rename and Reorder Vaults` lists every owned vault, including vault 1 (whose name is only a
+label — it changes nothing about its storage), as `Rename "<name>"`. Clicking one opens the
+client's gossip text box. The same submenu carries the `Move "<name>" Up` entries described
+under [Reordering](#reordering); the two share a menu but are otherwise unrelated.
 
 Content is not filtered. UI escape sequences are preserved on purpose, so colour and inline
 icons work:
@@ -414,6 +416,61 @@ Confirmed against a long Cyrillic name typed into the client: it stored as exact
 characters and 480 bytes, a clean two bytes per character, so the cut fell on a boundary and
 nothing was mangled. Note that `VARCHAR(255)` counts characters rather than bytes in MySQL, so
 the 480-byte name fits comfortably — the character count is the only thing 240 has to respect.
+
+## Reordering
+
+Vaults can be moved up and down the menu. The whole feature is one column,
+`mod_extended_bank_vaults.sort_order`, and the reason it stays that small is worth stating
+plainly, because there is an obvious-looking alternative that is much worse.
+
+**The vault number is never touched.** `vault` is the identity column: it is half the primary
+key of the metadata table, part of `UNIQUE KEY (owner_guid, vault, bag, slot)` on the item
+table, and the thing that decides which of the two storage tables an item belongs to.
+Renumbering vaults to reorder them would mean rewriting `mod_extended_bank_vault_items.vault`
+for every affected row, and a swap collides on that unique key exactly the way two items
+swapping slots inside one vault do — the same trap `PersistVaultLayout` pays for with
+delete-before-insert. The difference is the blast radius. A botched layout flush loses an edit;
+a botched renumber files items under the wrong vault. And the player would see nothing for it,
+because the numbers are internal.
+
+**The gossip action already carried the vault number**, as
+`EXTENDED_BANK_ACTION_OPEN_BASE + vault`, so menu position and vault identity were independent
+before any of this existed. Reordering the list changes the order of a loop, and nothing else.
+
+That makes the whole feature inert with respect to the invariant. No item row is read or
+written, so reordering needs none of the guards a vault switch does: it works with a vault
+open, in combat, mid-trade, and it cannot be made to duplicate or strand an item by any
+sequence of clicks.
+
+**Positions are renumbered from zero on every move**, in `PersistVaultOrder`, rather than
+swapping the two affected rows. That costs one `UPDATE` per vault on an action a player takes
+by hand — at most twenty, on a click — and buys a property worth more than the saving: the
+result never depends on what the previous values were. A realm that has never reordered has
+255 in every row; a half-applied write from an earlier abort leaves gaps or duplicates. Both
+resolve themselves the first time anything moves. The column deliberately carries no unique
+key, and `GetOwnedVaults` sorts on `(sort_order, vault)`, so even a partially applied
+renumbering is still a total order rather than an error.
+
+**A newly bought vault sorts last** because `BuyNextVault` writes `EXTENDED_BANK_SORT_LAST`
+(255) rather than a position. On a list nobody has reordered every row holds 255, they all
+tie, and the tiebreak on `vault` reproduces exactly the order the menu had before the column
+existed. Once anything is moved the list is renumbered 0..N-1, and 255 keeps meaning "after
+everything placed so far" for whatever is bought next.
+
+**The Main Vault is pinned to the front** rather than sorted there, so its own `sort_order` can
+never matter. It *is* `character_inventory` and the resting state of the bank; a fixed anchor
+is worth more than the freedom to bury it.
+
+**Moving is offered only where it does something.** The menu lists `Move "<name>" Up` from the
+third entry down — the first is the pinned default vault and the second has only that above
+it — so no line in the menu silently fails. `MoveVaultUp` refuses the same two cases anyway,
+which is what lets the debug command distinguish "already at the top" from "does not own it".
+
+Renaming and reordering share one submenu because they are the two things a player does to a
+vault rather than to its contents, and because a move entry has to sit beside the name it
+moves to be readable. They are otherwise entirely untangled: a move never touches a name, a
+rename never touches a position, and the default `Vault N` label keeps following the vault
+number rather than the menu position — so moving one vault can never appear to rename another.
 
 ## Design consequences, and why each one is accepted
 

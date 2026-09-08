@@ -42,6 +42,11 @@ constexpr uint32 EXTENDED_BANK_COPPER_PER_GOLD = 10000;
 // embeds the name in "Enter a new name for {}:", and below the VARCHAR(255) `name` column.
 constexpr std::size_t EXTENDED_BANK_VAULT_NAME_MAX_CHARS = 240;
 
+// A vault that has never been placed sorts after every vault that has. Reordering renumbers
+// the whole list from zero, so this value only ever survives on vaults bought since the last
+// move -- which is exactly where a newly bought vault belongs.
+constexpr uint8 EXTENDED_BANK_SORT_LAST = 255;
+
 // Highest per-vault price accepted from the config, in gold. MAX_MONEY_AMOUNT is 0x7FFFFFFF
 // copper, so anything above this cannot be paid anyway, and multiplying it by
 // EXTENDED_BANK_COPPER_PER_GOLD would wrap a uint32 and quietly make the vault cheap.
@@ -91,6 +96,10 @@ struct ExtendedBankVault
     uint8 Vault{ 0 };
     std::string Name;
     uint8 BagSlots{ 0 };
+
+    // Menu position only. It never identifies a vault, never appears in
+    // `mod_extended_bank_vault_items`, and reordering therefore cannot move an item.
+    uint8 SortOrder{ EXTENDED_BANK_SORT_LAST };
 };
 
 // One entry of the layout that was last written to `mod_extended_bank_vault_items`.
@@ -220,6 +229,12 @@ public:
     // fail. Nothing is written in that case.
     bool RenameVault(Player* player, uint8 vault, std::string const& name);
 
+    // Swaps a vault with the one above it in the menu. False when it does not own that vault,
+    // when it is the default vault -- which is pinned first -- or when it is already the
+    // topmost vault the player may move. Presentation only: no item row is read or written,
+    // so this is safe with a vault open, in combat, or mid-trade.
+    bool MoveVaultUp(Player* player, uint8 vault);
+
 private:
     /* -- vault metadata, in ExtendedBankVaults.cpp ------------------------ */
 
@@ -228,6 +243,12 @@ private:
     void LoadVaultList(ObjectGuid playerGuid);
     void SelfHealVaultRows(ObjectGuid::LowType lowGuid);
     void EnsureDefaultVaultRow(Player* player);
+
+    // Renumbers every vault's sort_order from the order given, rather than swapping a pair.
+    // Costs one UPDATE per vault on an action a player takes by hand, and in exchange the
+    // result never depends on what the previous values were: duplicates, gaps and the 255
+    // default all resolve themselves the first time anything is moved.
+    void PersistVaultOrder(ObjectGuid playerGuid, std::vector<uint8> const& order);
 
     // Writes the live bank bag slot count into a vault's row when it has changed. Buying a
     // slot only calls Player::SetBankBagSlotCount, so without this the purchase is lost the
