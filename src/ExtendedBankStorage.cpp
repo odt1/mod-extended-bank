@@ -127,6 +127,10 @@ void ExtendedBankMgr::CollectLiveBankItems(Player* player, std::vector<ExtendedB
         if (!bag)
             continue;
 
+        // Bag::GetBagSize returns uint32, so a uint8 counter would be a hang if a bag could
+        // report more than 255 slots. It cannot: Bag::Create refuses a template whose
+        // ContainerSlots exceeds MAX_BAG_SIZE, which is 36 (Bag.cpp:73, Bag.h:22).
+        // NOLINTNEXTLINE(bugprone-too-small-loop-variable)
         for (uint8 bagSlot = 0; bagSlot < bag->GetBagSize(); ++bagSlot)
             if (Item* content = bag->GetItemByPos(bagSlot))
                 items.push_back({ content, bag->GetGUID().GetCounter(), bagSlot });

@@ -46,3 +46,10 @@ local.properties
 .loadpath
 .project
 .cproject
+
+#
+# Static analysis
+#
+# cl /analyze drops one of these per translation unit unless it is given
+# /analyze:autolog-, which tools/analyze.ps1 does. A hand-run cl will not.
+*.nativecodeanalysis.xml

@@ -630,6 +630,323 @@ Two genuine exceptions were found by that sweep and are listed separately: the t
 - [ ] `CMSG_BANKER_ACTIVATE` for a creature that is not a banker, and for one out of range.
 - [x] Vault switches spammed as fast as the client will send them.
 
+## 13. AddressSanitizer
+
+**Not run. Nothing below has been done** — this section is the recipe and the argument for it,
+written down on 2026-09-09 so it does not have to be worked out again. The build it describes
+has never been made.
+
+It matters because of the line in *What is left* about the cases that need an instrumented
+build. Every landmine in `CLAUDE.md` is a lifetime bug — `Item::SaveToDB` deleting the object,
+a dangling `m_itemUpdateQueue` entry, an `Item` freed while the core still points at it — and
+the free is in this module while the use is in the core. Static analysis is
+single-translation-unit and structurally cannot reach across that seam. ASan does not care
+where either half lives.
+
+To do, once the build exists:
+
+- [ ] Make the build. The recipe below is complete but untried against the full core; expect to
+      have to fix something.
+- [ ] A plain vault switch cycle: open vault 2, switch to 3, switch to 1, walk away. This is
+      `DetachLiveBank` freeing every `Item` in the bank, the densest free/reuse window the
+      module has.
+- [ ] Logout with a vault open (`FlushAndDetachForLogout`), and a map change with one open.
+- [ ] Each drain entry point that frees items: `OnPlayerSave`, the packet hook, and
+      `SaveInventoryAndGoldToDB` via a mail send from an open vault.
+- [ ] The eviction path: drop a restricted item onto an occupied vault slot so it is mailed.
+      `EvictRestrictedItems` calls `ReleaseItem` and hands the pointer to a `MailDraft`.
+- [ ] `AttachVault`'s failure branches — an unknown item entry, and a unique collision with
+      `ExtendedBank.AllowRestrictedItems = 1`. Both free or re-own an `Item` mid-loop.
+- [ ] Hard-kill the server with a vault open, restart, log in. Covers `SelfHealVaultRows`.
+
+What follows is the explanation as it was written, unedited except that its headings sit one
+level deeper to fit inside this section.
+
+### "Add debug"
+
+Your build directory is a **Visual Studio multi-config generator**, and all four configs are
+already generated. So a Debug build needs no reconfigure at all — just swap the word:
+
+```
+cmake --build C:/Games/AzerothCore/build --config Debug --parallel
+```
+
+It lands in `build/bin/Debug/` and leaves your RelWithDebInfo binaries alone.
+
+You probably don't want it, though. AzerothCore's Debug config is `/Od /RTC1` against the debug
+CRT, which turns on MSVC's checked iterators — a worldserver like that is slow enough to be
+miserable to actually play on. And RelWithDebInfo already carries `/Zi`, so you have full
+symbols and line numbers today. Debug buys you unoptimized locals in the debugger, not "more
+information".
+
+### ASan
+
+This one **does** need a reconfigure, because it is a compile flag — every translation unit has
+to be instrumented, and the bug you are hunting lives in the seam between your module and the
+core, so the core needs it too.
+
+Do it in a **second build directory**. Reconfiguring the existing one would regenerate all
+960-odd project files and likely cost you a full RelWithDebInfo rebuild for nothing.
+
+**1. Configure** (mirrors your current cache; `-A x64` and the generator name come from it):
+
+```powershell
+cmake -S C:/Games/AzerothCore -B C:/Games/AzerothCore/build-asan -G "Visual Studio 18 2026" -A x64 `
+  -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="/Zi /O2 /Ob1 /DNDEBUG /bigobj /fsanitize=address" `
+  -DCMAKE_C_FLAGS_RELWITHDEBINFO="/Zi /O2 /Ob1 /DNDEBUG /fsanitize=address" `
+  -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO="/debug /INCREMENTAL:NO" `
+  -DSCRIPTS=static -DMODULES=static -DAPPS_BUILD=world-only -DTOOLS_BUILD=none `
+  -DMYSQL_INCLUDE_DIR="C:/Program Files/MySQL/MySQL Server 8.4/include" `
+  -DMYSQL_LIBRARY="C:/Program Files/MySQL/MySQL Server 8.4/lib/libmysql.lib" `
+  -DMYSQL_EXECUTABLE="C:/Games/AzerothCore/Requirements/mysqlbin/mysql.exe"
+```
+
+`/INCREMENTAL:NO` because your cache has `/debug /INCREMENTAL` and incremental linking does not
+survive ASan. `/bigobj` because instrumentation inflates object files and this codebase already
+has large translation units.
+
+**2. Build** — worldserver only, since that is the one you run:
+
+```powershell
+cmake --build C:/Games/AzerothCore/build-asan --config RelWithDebInfo --parallel --target worldserver
+```
+
+**3. The step that will otherwise waste your afternoon.** I verified this: the instrumented exe
+imports `clang_rt.asan_dynamic-x86_64.dll`, that DLL ships inside the MSVC toolset, and the
+toolset's `bin` is **not** on a normal PATH. Without it the process dies instantly with
+`0xC0000135` (`STATUS_DLL_NOT_FOUND`) and no message at all.
+
+Copy the ASan worldserver next to your working one under a different name, so it inherits the
+`configs/`, `data/`, `libmysql.dll` and OpenSSL DLLs already sitting there:
+
+```powershell
+$bin = "C:\Games\AzerothCore\build\bin\RelWithDebInfo"
+$vc  = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64"
+Copy-Item C:\Games\AzerothCore\build-asan\bin\RelWithDebInfo\worldserver.exe "$bin\worldserver-asan.exe"
+Copy-Item "$vc\clang_rt.asan_dynamic-x86_64.dll" $bin
+```
+
+The pdb keeps its absolute path inside the exe, so symbols resolve from `build-asan` without
+copying it.
+
+**4. Run it** the way you run the normal one (`-c <path>` if your launcher passes a config),
+with reports going to a file rather than a console that scrolls:
+
+```powershell
+$env:ASAN_OPTIONS = "log_path=C:\Games\AzerothCore\build\asan;halt_on_error=1"
+.\worldserver-asan.exe
+```
+
+`log_path` writes `asan.<pid>`. Worth it — the report arrives as the process is dying.
+
+### What it costs, and what it gets you
+
+Disk is the real price: your `build` is **40 GB** and you have **114 GB free on a 94%-full
+drive**. Budget around 40 GB for `build-asan`; `-DAPPS_BUILD=world-only --target worldserver` is
+what keeps it from being more. Delete the directory when you're done. Runtime is roughly 2x
+slower and noticeably hungrier for memory.
+
+I ran an end-to-end probe to confirm the toolchain actually works here — a deliberate
+use-after-free on this machine's toolset:
+
+```
+==26560==ERROR: AddressSanitizer: heap-use-after-free on address 0x1004800204b4
+READ of size 4 at 0x1004800204b4 thread T0
+    #0 ... in main ...\asan_probe.cpp:2
+freed by thread T0 here:
+    #0 ... in operator delete[](void *)
+    #1 ... in main ...\asan_probe.cpp:2
+```
+
+Both stacks — where it was used and where it was freed — with file and line. That is exactly
+the report shape you'd get for a freed `Item` still reachable through `m_itemUpdateQueue`, and
+it's the thing no static analyser on this codebase can reach, because the free is in your
+module and the use is in the core.
+
+One caveat I did not test: the core installs `WheatyExceptionReport` as an unhandled-exception
+filter. ASan prints its report before raising anything, so it should win, but if a run dies with
+a Wheaty crash dump and no ASan output, that's the first suspect.
+
+Correction to what I said earlier: I claimed `/RTC1` and `/fsanitize=address` were incompatible.
+On toolset 14.51 they compile together fine. Dropping `/RTC1` is still right — ASan supersedes
+what it checks — but it isn't a blocker.
+
+## 14. Destroying an item from inside a vault
+
+The client's delete path never learns a vault exists, so this is a test of whether the drain
+notices an item that left the bank by being destroyed rather than by being moved.
+
+**What the core does.** `CMSG_DESTROYITEM` reaches `WorldSession::HandleDestroyItemOpcode`
+(`ItemHandler.cpp:280`), which calls `recoveryItem` and then `Player::DestroyItem`. That ends
+at `pItem->SetState(ITEM_REMOVED, this)` (`PlayerStorage.cpp:3212`) and **does not delete the
+`item_instance` row itself** — it only clears the slot and queues the item. It knows nothing
+about `mod_extended_bank_vault_items`.
+
+**So the whole outcome rests on the drain.** On the next packet or tick,
+`CollectLiveBankItems` no longer sees the item, `ComputeLayoutDelta` puts its GUID in
+`Removed`, `PersistVaultLayout` deletes its vault row, `itemLeftVault` becomes true, and
+`SaveInventoryAndGoldToDB` runs `Item::SaveToDB`, which on `ITEM_REMOVED` deletes the
+`item_instance` row and the object (`Item.cpp:407`) — all in one transaction. Two failures are
+possible if that chain is wrong: a vault row left pointing at a deleted item (check 2), or an
+`item_instance` row reachable from nowhere (check 11).
+
+**All of it verified 2026-09-09** on Testtwo (guid 24009), vault 2, with the running build
+ahead of every commit. The measure used throughout is an accounting identity that needs no
+baseline to trust: every `item_instance` row owned by the character must be either in
+`character_inventory` or in a vault. It held after every step.
+
+- [x] Destroy a whole item from a global bank slot (39..66) of a vault other than the Main one.
+      Vault rows 113 → 112, all of it from the global slots (35 → 34) with the four bank bags
+      untouched; the stack went from 100 shells / 100000 to 99 / 99000, so a whole stack and
+      not a partial. **135 instances = 23 inventory + 112 vaulted**, so the vault row and the
+      `item_instance` row went together. `character_inventory` untouched, `Errors.log` unmoved.
+- [x] Destroy **part of a stack**. This takes `DestroyItemCount`, not `DestroyItem`: the item
+      stays `ITEM_CHANGED`, so the vault row must survive and only `item_instance.count` drops.
+      The passing result is the opposite of the one above and it is what happened —
+      `mod_extended_bank_vault_items` came back **byte-identical**, and exactly one of 135
+      `item_instance` rows changed, count 1000 → 990.
+- [x] Destroy an item that is **inside a bank bag** in a vault, so its vault row carries
+      `bag != 0`. One row removed, `vault=2 bag=124575086 slot=1 item=124575152`; that bag went
+      24 → 23 while the global slots and the other three bags did not move. A vault row's `bag`
+      column is an item GUID, so resolving it wrongly would have deleted someone else's row.
+- [x] Destroy an **empty bank bag** sitting in a vault's bag slot. Its own vault row goes and
+      the vault's `bag_slots` is unaffected. Both confirmed: the row `vault=2 bag=0 slot=73`
+      went with its `item_instance` (entry 51809), and `bag_slots` stayed at 7. Had it
+      decremented, the next attach would have found one bag more than it had slots and mailed
+      one back.
+- [x] Confirm a **non-empty** bank bag is refused, as it is in the vanilla bank —
+      `HandleDestroyItemOpcode` checks `IsBagPos` and `CanUnequipItem` before anything else.
+      Refused with *"You can only do that with empty bags"*, which is
+      `EQUIP_ERR_CAN_ONLY_DO_WITH_EMPTY_BAGS` sent by the **server** as
+      `SMSG_INVENTORY_CHANGE_FAILURE` — so the packet arrived and the server turned it down,
+      rather than the client blocking it. All five tables identical afterwards. `recovery_item`
+      also stayed put, which proves the bag check returns *before* `recoveryItem`: a refused
+      destroy leaves no phantom recovery row.
+- [x] Destroy, then walk out of range immediately, so the revert races the drain. The drain won
+      comfortably, as expected — movement packets fire at once and every one is preceded by it.
+      One row gone, accounting exact at 132 = 23 + 109, nothing new in either log.
+The Main Vault control — destroying from it — is not run, deliberately. It is the stock code
+path with no module code in it, and the six runs above already show `character_inventory`
+unmoved throughout, which is the stronger statement.
+
+## 15. Aggressive client-side bank sorting
+
+ElvUI sorts a bank client-side: it builds a move list and fires one `PickupContainerItem` pair
+per frame, so a full sort arrives as dozens of swap packets in a couple of seconds. Every one
+of them is preceded by the module's drain, and every one carries queued items, so each is a
+full slow-path flush — transaction, delta, statements.
+
+**What is actually under test is `PersistVaultLayout`'s delete-before-insert ordering.** A
+sort is nothing but simultaneous position swaps, which is exactly the case that collides on
+`UNIQUE KEY (owner_guid, vault, bag, slot)` if a single `INSERT` is emitted before the previous
+occupant's `DELETE`. Commits are asynchronous, so such a collision aborts the transaction with
+no sign in game at all: the vault simply reverts to its last good flush, and `Errors.log` is
+the only witness. Read that file, not the screen.
+
+**Run 2026-09-09** on Testtwo, sorting vault 3 (86 items: 28 in global slots, five bank bags,
+three of them holding 24/24/5). The Main Vault was deliberately filled first — all 28 bank item
+slots plus five bank bags — so that a revert landing mid-queue would have something real to
+scramble. Four runs, moving 34, 59, 42 and 71 items. **`Errors.log` did not gain a line on any
+of them**, which is the ordering holding across every scale of churn the client can produce.
+
+- [x] Sort a well-stocked vault other than the Main one, with bank bags so moves cross between
+      global slots and bag contents. Run to completion: **71 positions changed**, the largest
+      churn of the four. ElvUI consolidated the vault as it is designed to — all 28 global item
+      slots emptied into the bank bags, which finished holding 24/24/24/9 with only the five
+      bags themselves left in slots 67..71. Vault 3 came back with **the same 86 items**, vault
+      2 untouched, `character_inventory` and `item_instance` identical. *Still not checked: that
+      the stored arrangement matches the screen position for position. The layout above is
+      consistent with what ElvUI does, but that is inference, not observation.*
+- [x] Stop the sort mid-run. The database must match the half-sorted screen, not the state
+      before or after. Reached by the walk-away below; the vault persisted a genuinely
+      intermediate arrangement, intact.
+- [x] **Walk out of range mid-sort.** `UpdateRangeCheck` reverts to the Main Vault while
+      ElvUI still holds a queue of moves, which then land on whatever now occupies those
+      slots — the Main Vault's own items. Every move is a legal core operation, so this should
+      cost nothing, but it rearranges `character_inventory`, and that is the one table the
+      module promises never to disturb. **It never got the chance:** the Main Vault's bank
+      slots 39..73 came back byte-identical, and so did the contents of its five bank bags.
+      ElvUI gates its queue on the bank frame being shown, and walking away closes the frame.
+- [x] **Kill the client mid-sort.** Harsher than the walk-away: `FlushAndDetachForLogout` has
+      to persist whatever the last executed move left behind with no chance to finish the
+      queue. `Wow.exe` killed from Task Manager after 59 items had moved; the session went
+      linkdead and `characters.online` cleared 10-15 seconds later, well inside
+      `SocketTimeOutTimeActive`. Afterwards **the whole of `character_inventory` was
+      byte-identical**, not merely its bank slots, `item_instance` was identical, vault 3 held
+      the same items, and `Errors.log` had not moved.
+- [x] **Kill the server mid-sort**, restart, compare. The last flush wins; nothing may be
+      duplicated. `taskkill /F` after 42 moves had committed. Read while the server was down,
+      which is the one moment the database cannot move underneath the query — and the only
+      moment `Errors.log` is still readable, since it reopens in `w` mode and truncates on
+      startup. Same 86 items, no duplicate `(owner, vault, bag, slot)` anywhere in the table,
+      `character_inventory` byte-identical, no aborted statement. After the restart and login:
+      `character_inventory` byte-identical to the frozen state, all five Main Vault bank bags
+      back in slots 67..71, **zero mail rows**, and the vault rows unchanged — the restart
+      neither replayed nor lost anything. Losing the sort's last few moves would have been a
+      pass in any case; it did not cost even that.
+- [x] Switch vaults from the gossip menu immediately after a sort, before the queue drains.
+      **Unreachable, and that is the answer rather than a gap.** The reasoning that made this
+      look like the dangerous case was that a gossip switch re-sends `SMSG_SHOW_BANK`, so the
+      frame would stay open and refresh with a different vault's contents beneath a queue that
+      addresses slots by index. The stock client will not do it: the gossip frame and the bank
+      frame cannot both be shown, so reaching the vault list closes the bank — and ElvUI gates
+      its queue on the bank frame, so the queue dies exactly as it does on a walk-away.
+      Confirmed at the client 2026-09-09. The case where queued moves execute against another
+      vault's items is closed by the client's own panel exclusivity, not by timing, which also
+      explains why the walk-away run left the Main Vault untouched rather than getting lucky.
+
+**The Main Vault control is not run, deliberately.** Sorting it, and destroying from it, are
+the stock client against the stock core: the Main Vault *is* `character_inventory`, the module
+holds no session while it is the live one, and no module code sits in either path. Every run
+above already carries the stronger version of that control anyway — `character_inventory` came
+back byte-identical after each.
+
+**What the server kill did not reach.** `characters.bankSlots` read 5 at the moment of the
+kill — the Main Vault's own count, already correct — so `OnPlayerLoadFromDB` had nothing to
+correct and the crash-insurance path in §3 was not exercised. It reads 5 because no periodic
+`SaveToDB` landed inside the bank visit: `PlayerSave.Interval` is minutes, the sort and kill
+took seconds, and the module's flush writes the live bag count to the vault row, never to
+`PLAYER_BYTES_2`. Reaching that path needs a periodic save to fall *inside* a visit and then a
+crash before the revert. Narrow, which is good for the realm and awkward for testing it. The
+mail-back failure it guards against is narrower still: it needs the live vault to have *fewer*
+bag slots than the Main Vault, and none of this character's three do.
+
+**Realm baseline for check 11, and a theory of mine that was wrong.** Before any of this,
+`check_invariants.sql` already reported six orphaned `item_instance` rows owned by Die —
+Thorium Shells, Runecloth twice, Dark Iron Scraps, a Scroll of Agility VI and Jadefire Pants.
+I first put these down to vendor buyback leftovers. **That is wrong:** `Player::_SaveInventory`
+deletes both the `character_inventory` row and the `item_instance` row for every item in a
+buyback slot, on every save (`PlayerStorage.cpp:7443-7449`), so a buyback item has no rows at
+all rather than orphaned ones. The reagent bank modules are out too — `custom_reagent_bank` and
+`mod_reagent_bank_account` store `item_entry` and `amount`, never item GUIDs, and that
+character has no rows in either.
+
+What can be said positively is that nothing is lost and the module is very unlikely to be the
+cause. The accounting closes exactly: 247 `item_instance` rows = 167 `character_inventory` + 74
+vaulted + 6 orphans, so every item that character can reach is correctly referenced, and the
+six are surplus rows pointing at items in no container — litter, not damage, and incapable of
+duplicating anything. The module's only known route to producing one is a crash landing between
+a vault flush and the core's inventory write, and **there has not been a crash since that
+character started using the module**: 65 crash reports going back to April 2025, the most recent
+dated 2026-09-05 01:22, against vaults created at 01:30:47 the same night. Six other characters
+carry an orphan each and none of them has ever used the module, their GUIDs clustering tightly
+at 27.6M-32.2M while this character's are scattered across four different eras; and the two most
+heavily exercised module characters carry none at all.
+
+The cause remains unknown — this realm runs some thirty modules, several of which touch items,
+and `Errors.log` carries a genuinely failed `[1062] Duplicate entry ... auctionhouse.item_guid`,
+which is the right shape for an item pulled from inventory whose auction row never landed. The
+six GUIDs are baselined in the test harness. Playing a normal session with vault use and
+re-running the check settles it: still six means it is not this module, seven means there is
+something live to chase.
+
+**Deployment note, found in `Server.log` during these runs.** The realm's deployed
+`configs/modules/mod_extended_bank.conf` still carried only the original three settings, so the
+core logged *"Missing property ExtendedBank.AllowRestrictedItems"* on startup. The default is
+used and behaviour is correct, but the warning repeats on every startup and reload, and that
+noise is how a real config warning gets missed later. Adding a setting to the `.conf.dist`
+means refreshing the deployed copy too.
+
 ## Regression pass after the 2026-09-03 refactor
 
 `ExtendedBankStorage.cpp` was split, four helpers were extracted, and four behaviours changed on
@@ -768,9 +1085,17 @@ do not own; `.pdump` round-trip; a stack that merges on attach; §10's multi-cha
 entries beyond the ones already run.
 
 **Not reachable from a client, and why:** the trade-partner race (the bank and trade frames
-cannot both be open, and hiding the trade frame cancels the trade); a restricted *bag* with
-ordinary contents inside a vault; the mail/auction reach-in that `SelfHealVaultRows` repairs.
-Each needs a forged packet or an instrumented build.
+cannot both be open, and hiding the trade frame cancels the trade); §15's gossip switch during
+a sort queue, for the same reason one panel further along — the gossip and bank frames cannot
+both be shown, so reaching the vault list closes the bank and the queue dies with it; a
+restricted *bag* with ordinary contents inside a vault; the mail/auction reach-in that
+`SelfHealVaultRows` repairs. The last two need a forged packet or an instrumented build — §13
+is the recipe for that build, and it has not been run.
+
+The client's panel exclusivity is doing real work in this module's favour, and it is worth
+naming as a dependency rather than a coincidence: it is what keeps a live vault out of a trade,
+and what stops a sort queue from following a vault switch. An addon that replaced those frames
+with ones that coexist would reopen both cases.
 
 **Closed by construction, not by clicking:** §11's handler list — `opHandle->Call` exists in
 four places in the server and every one is preceded by the drain; §2's menu overflow — the

@@ -85,9 +85,14 @@ GROUP BY owner_guid;
 --     gap between a vault flush and the core's inventory write.
 --
 --     Scoped to characters that actually use the module, because an established realm carries
---     unrelated orphans of its own (buyback leftovers, old bot data, modules that delete rows
---     without clearing item_instance). Drop the last line to audit the whole realm, but
---     baseline it first or the result is noise.
+--     unrelated orphans of its own -- old bot data, GM commands, an aborted statement, or any
+--     of the other modules that remove an item without clearing item_instance. Drop the last
+--     line to audit the whole realm, but baseline it first or the result is noise.
+--
+--     Not vendor buyback, which was the first guess and is wrong: Player::_SaveInventory
+--     deletes both the character_inventory row and the item_instance row for every item in a
+--     buyback slot, on every save (PlayerStorage.cpp:7443-7449), so a buyback item has no
+--     rows at all rather than orphaned ones.
 SELECT 'orphan_item_instance' AS check_name, ii.owner_guid, ii.guid, ii.itemEntry
 FROM item_instance ii
 JOIN characters c ON c.guid = ii.owner_guid

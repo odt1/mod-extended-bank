@@ -153,6 +153,7 @@ Other landmines, each already paid for once:
 | `src/ExtendedBankConfig.cpp` | `ConfigValueCache` + `WorldScript` |
 | `src/ExtendedBankCommands.cpp` | `.vault` debug commands, all `Console::Yes` |
 | `tools/check_invariants.sql` | 11 read-only DB checks; zero rows = healthy |
+| `tools/analyze.ps1` | runs every installed static analyser against any AzerothCore module; no build needed |
 | `tools/logo.py` | regenerates `images/logo.png`; reads an extracted client, so it needs local MPQ paths |
 
 Two entry points reach the gossip menu, and both must keep working: bankers *with*
@@ -174,8 +175,26 @@ when a creature's menu has no options at all — do not break that path.
 
 ## Commands
 
+```powershell
+# Everything static, in one go: codestyle, cl /analyze, clang-tidy, cppcheck.
+# ~70s for this module and it needs no build -- the compiler flags are read out of the
+# .vcxproj CMake already generated, so they are the real ones and follow the build config.
+# Exit code is the number of analysers that found something.
+pwsh -File tools/analyze.ps1
+pwsh -File tools/analyze.ps1 -Only clang-tidy      # one of them
+pwsh -File tools/analyze.ps1 -ListTools            # what is installed and where
+```
+
+`.clang-tidy` holds the check list. Its disabled entries are the ones that are
+systematically wrong for AzerothCore — `performance-unnecessary-value-param` fights both the
+core's by-value `CharacterDatabaseTransaction` and the `ChatCommand` argument binder, and
+`misc-include-cleaner` wants core headers named in a way the core does not write them.
+A false positive that fires at a *single* site goes in a `NOLINT` comment there with its
+reason instead, so the check keeps working everywhere else; there are three such sites, and
+each names the core line that proves the case.
+
 ```bash
-# Lint (run both; the core one reports the whole tree, so filter)
+# The two linters on their own (the core one reports the whole tree, so filter)
 # ci-codestyle.sh greps a RELATIVE "src" -- run it from the module root or it silently
 # scans the core's sources instead and reports their tabs as yours.
 bash apps/ci/ci-codestyle.sh

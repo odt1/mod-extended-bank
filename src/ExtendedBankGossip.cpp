@@ -407,8 +407,13 @@ public:
     }
 };
 
+// ScriptMgr takes ownership in the ScriptObject constructor and deletes every
+// registered script at shutdown (ScriptMgr.cpp:161). The analyser sees only the
+// bare `new`, which is how every AzerothCore script is registered.
+// NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
 void AddExtendedBankGossipScripts()
 {
     new ExtendedBankGossipScript();
     new ExtendedBankPacketScript();
 }
+// NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)

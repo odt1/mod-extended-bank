@@ -1,0 +1,45 @@
+# Checks for this module. tools/analyze.ps1 finds this file and lets clang-tidy read it
+# rather than passing --checks, so a bare `clang-tidy` run and an editor's clangd apply the
+# same rules the script does. The script carries an identical list as its fallback, for a
+# module that has no .clang-tidy of its own.
+#
+# The disabled entries are the ones that are systematically wrong for AzerothCore rather
+# than wrong once. A false positive that fires at a single site belongs in a NOLINT comment
+# there, with its reason, so the check keeps working everywhere else.
+#
+#   performance-unnecessary-value-param  The core passes CharacterDatabaseTransaction by
+#                                        value everywhere, and a ChatCommand handler's
+#                                        signature is fixed by the argument binder.
+#   misc-const-correctness               Fires on most locals in a codebase that does not
+#                                        write const on locals.
+#   misc-include-cleaner                 Wants every transitively used core header named
+#                                        directly; the core's headers are not written that
+#                                        way.
+#   misc-non-private-member-variables-in-classes
+#                                        This module's structs are deliberately plain data.
+#   misc-use-internal-linkage            Disagrees with Addmod_extended_bankScripts().
+#   misc-override-with-different-visibility, bugprone-easily-swappable-parameters,
+#   performance-enum-size                Noise at this scale.
+
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  misc-*,
+  readability-misleading-indentation,
+  readability-inconsistent-declaration-parameter-name,
+  readability-non-const-parameter,
+  -bugprone-easily-swappable-parameters,
+  -misc-const-correctness,
+  -misc-include-cleaner,
+  -misc-non-private-member-variables-in-classes,
+  -misc-override-with-different-visibility,
+  -misc-use-internal-linkage,
+  -performance-enum-size,
+  -performance-unnecessary-value-param
+
+HeaderFilterRegex: 'mod-extended-bank'
+FormatStyle: none
+WarningsAsErrors: ''

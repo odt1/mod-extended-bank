@@ -12,6 +12,11 @@
 #include "Tokenize.h"
 #include <algorithm>
 
+// A throwing constructor at namespace scope cannot be caught, and this one can technically
+// throw: ConfigValueCache's constructor resizes a vector. Four elements, before the world
+// exists, on a path where a bad_alloc would end the process anyway -- and this is the shape
+// every AzerothCore config singleton has. Left as it is on purpose.
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization)
 ExtendedBankConfig sExtendedBankConfig;
 
 void ExtendedBankConfig::BuildConfigCache()
@@ -109,7 +114,12 @@ public:
     }
 };
 
+// ScriptMgr takes ownership in the ScriptObject constructor and deletes every
+// registered script at shutdown (ScriptMgr.cpp:161). The analyser sees only the
+// bare `new`, which is how every AzerothCore script is registered.
+// NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
 void AddExtendedBankConfigScripts()
 {
     new ExtendedBankWorldScript();
 }
+// NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
