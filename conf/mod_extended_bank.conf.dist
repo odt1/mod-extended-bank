@@ -11,96 +11,110 @@
 # mod-extended-bank configuration
 ########################################
 #
+# This module gives each character several banks instead of one. Players pick which to open
+# from a menu on any banker, and the ordinary bank window shows that one's contents. Nothing
+# is installed on the client side and nothing about the first bank changes.
+#
+# There are four settings. Three of them are balance dials you can turn freely. The fourth,
+# AllowRestrictedItems, changes what your realm treats as an exploit, and its section explains
+# at length what turning it on costs.
+#
+# All four take effect on `.reload config`, with no restart.
+#
+########################################
+#
 #    ExtendedBank.Enable
-#        Description: Master switch. When disabled, banker NPCs behave exactly like
-#                     stock AzerothCore and the module touches nothing.
+#        Description: Master switch. Turn it off and every banker behaves exactly as it does
+#                     on stock AzerothCore.
+#                     Worth knowing for when something looks wrong: disabling does not delete
+#                     anything. Vaults and their contents stay in the database, players simply
+#                     cannot reach vaults beyond the first, and turning it back on restores
+#                     the menu with everything still in place. So this is a safe thing to
+#                     toggle while you work out whether the module is actually involved.
 #        Default:     1 - Enabled
 #                     0 - Disabled
-#
-#        Hot-reloadable with `.reload config`.
 #
 
 ExtendedBank.Enable = 1
 
 #
 #    ExtendedBank.MaxVaults
-#        Description: Total number of vaults a character may own, including the
-#                     vanilla bank (vault 1). A value of 8 therefore allows 7
-#                     purchasable vaults.
-#                     Lowering this below a character's owned vault count never
-#                     hides or deletes vaults; it only blocks further purchases.
+#        Description: How many banks a character may end up owning in total, counting the one
+#                     they already had. The default of 8 means the original plus 7 to buy.
+#                     Lowering this later never hides or deletes a vault. Characters keep
+#                     everything they already own and simply cannot buy more, so it is safe to
+#                     change your mind about.
+#                     The ceiling of 20 is not arbitrary. A banker's menu holds 32 entries in
+#                     total, and the vault list has to share that with whatever else the NPC
+#                     offers, plus the buy and rename options.
 #        Range:       1 - 20
 #        Default:     8
-#
-#        Hot-reloadable with `.reload config`.
 #
 
 ExtendedBank.MaxVaults = 8
 
 #
 #    ExtendedBank.VaultCost
-#        Description: Comma-separated purchase price in GOLD for each vault beyond
-#                     the first. The first value is the price of vault 2, the
-#                     second of vault 3, and so on.
-#                     If the list is shorter than MaxVaults - 1, the last value is
-#                     reused for every remaining vault.
+#        Description: What each vault costs, in GOLD, as a comma-separated list. The first
+#                     number buys vault 2, the second buys vault 3, and so on. If the list runs
+#                     out before MaxVaults does, the last number is charged for everything
+#                     remaining.
+#                     The defaults are steep on purpose. Bank space is a real advantage, and
+#                     the whole point of the price curve is that a second bank should be a
+#                     goal rather than a formality. They also make a useful gold sink, which
+#                     most long-running realms need more than they need another vendor.
+#                     Lower them freely if that is not the game you are running. Nothing else
+#                     depends on these numbers.
 #        Default:     "100,1000,2500,6000,18000,38000,90000"
-#
-#        Hot-reloadable with `.reload config`.
 #
 
 ExtendedBank.VaultCost = "100,1000,2500,6000,18000,38000,90000"
 
 #
 #    ExtendedBank.AllowRestrictedItems
-#        Description: Removes the filter that keeps certain items out of every vault
-#                     except the Main one.
+#        Description: Removes the filter that keeps certain items out of every vault except the
+#                     first one.
 #                     LEAVE THIS AT 0 UNLESS YOU HAVE READ WHAT FOLLOWS.
 #
-#                     By default a vault other than the Main one refuses two kinds of
-#                     item, and hands back anything of either kind already inside it:
+#                     By default, a vault other than the first refuses two kinds of item, and
+#                     hands back anything of either kind already inside it:
 #
-#                       * Items the game caps per character - anything Unique, and
-#                         anything in a limit category such as "Unique-Equipped:
-#                         Jewelcrafter's Gems (3)".
-#                       * Items with a duration.
+#                       * Items the game caps per character. Anything Unique, and anything in
+#                         a limit category such as "Unique-Equipped: Jewelcrafter's Gems (3)".
+#                       * Items with a countdown on them.
 #
-#                     Both refusals exist for one reason. A stowed vault is not part of
-#                     the character's inventory as far as the rest of the server is
-#                     concerned, so anything the server enforces by counting an
-#                     inventory, or by ticking a clock, stops applying to what is in
-#                     there:
+#                     Both refusals exist for one reason. A vault the player is not currently
+#                     standing in front of is invisible to the rest of the server, so anything
+#                     the server enforces by counting an inventory, or by ticking a clock,
+#                     stops applying to whatever is parked in there:
 #
-#                       * A cap is enforced by counting the character's inventory, bank
-#                         included. A capped item parked in a stowed vault is not
-#                         counted, so its owner can go and acquire another one.
-#                       * A duration is ticked over the items a character has loaded,
-#                         and stowing a vault detaches its items, so the clock stops.
-#                         The item ages only while its vault is open. Vanilla pauses
-#                         these clocks too, but only while the character is logged out.
-#                         A vault gives the same pause for free, while the player
-#                         carries on playing.
+#                       * A cap is enforced by counting what the character is carrying, bank
+#                         included. An item parked in a closed vault is not counted, so its
+#                         owner can go and acquire another one.
+#                       * A countdown only advances over the items a character has loaded, and
+#                         closing a vault unloads its contents, so the clock stops. The item
+#                         ages only while its vault is open. The game already pauses these
+#                         clocks, but only while the character is logged out, which costs the
+#                         player their playing time. A vault gives the same pause for free
+#                         while they carry on playing.
 #
-#                     Setting this to 1 accepts both of those as the price of the
-#                     convenience. It also accepts one consequence that is not a
-#                     balance question at all:
+#                     Setting this to 1 accepts both of those as the price of the convenience.
+#                     It also accepts one consequence that has nothing to do with balance:
 #
-#                       * A vault is opened by storing its items through the core's own
-#                         check, which does not know this setting exists and applies the
-#                         cap regardless. So if a character stows a Unique item and then
-#                         acquires a second copy, the stowed one cannot be placed when
-#                         that vault is next opened, and is MAILED BACK to its owner. It
-#                         is not destroyed, but it leaves the vault without being asked
-#                         to, and mail expires.
+#                       * Opening a vault puts its items back through the core's own storage
+#                         check, which knows nothing about this setting and applies the cap
+#                         regardless. So if a character stores a Unique item and later acquires
+#                         a second copy, the stored one cannot be placed when that vault is
+#                         next opened, and is MAILED BACK to its owner. It is not destroyed,
+#                         but it leaves the vault without anyone asking it to, and mail
+#                         expires.
 #
-#                     Setting it back to 0 is safe and needs no cleanup: each vault
-#                     hands its offending items back the next time it is opened - to the
-#                     character's bags, or by mail if those are full.
-#
+#                     Setting it back to 0 is safe and needs no cleanup. Each vault hands its
+#                     offending items back the next time it is opened, either into the
+#                     character's bags or by mail if those are full. The one thing turning it
+#                     off cannot undo is a duplicate somebody created while it was on.
 #        Default:     0 - Refuse these items (recommended)
 #                     1 - Allow them, accepting everything above
-#
-#        Hot-reloadable with `.reload config`.
 #
 
 ExtendedBank.AllowRestrictedItems = 0

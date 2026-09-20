@@ -5,6 +5,27 @@
  * AzerothCore. See LICENSE in the root of this repository.
  */
 
+/*
+ * The menu on the banker, and the packet hook that gets it in front of players.
+ *
+ * Two separate problems are solved here, and they look unrelated until you know why.
+ *
+ * The first is that a banker NPC has to offer a list of vaults where it would normally have
+ * offered "let me see my bank". The module rebuilds the NPC's menu to do that, carefully
+ * keeping whatever else the NPC offers, because plenty of bankers are also innkeepers or
+ * vendors and nobody wants their stable master to stop working.
+ *
+ * The second is that most bankers never show a menu at all. Right-clicking one sends a
+ * "open my bank" packet straight to the server, which answers by opening the bank window,
+ * and no gossip code runs anywhere in that path. The only way in is to intercept that packet
+ * before the core handles it, which is why this file also owns a packet hook.
+ *
+ * That same hook carries a second, entirely unrelated duty described at the bottom of the
+ * file: it is the earliest point at which the module can protect an open vault from the
+ * core's inventory save. Two jobs in one hook is not elegant, but both need to happen before
+ * any packet is handled, and there is only one place that runs there.
+ */
+
 #include "ExtendedBank.h"
 #include "Creature.h"
 #include "GossipDef.h"
@@ -23,9 +44,10 @@
 
 namespace
 {
-    // Core's own DB-driven options always carry sender 0 (see Player::PrepareGossipMenu),
-    // and this value is far outside the range any script uses, so a select can be routed
-    // by sender alone.
+    // Stamped on every menu entry this module adds, so that when a player clicks something
+    // the module can tell its own entries apart from the NPC's without guessing. Menu entries
+    // the core builds from the database always carry zero here, and this value is far outside
+    // anything a script would pick, so there is no chance of a collision.
     constexpr uint32 EXTENDED_BANK_SENDER = 0xEB000001;
 
     enum ExtendedBankGossipAction : uint32
@@ -51,22 +73,26 @@ namespace
         return copper / EXTENDED_BANK_COPPER_PER_GOLD;
     }
 
-    // GossipMenu::AddMenuItem asserts past GOSSIP_MAX_MENU_ITEMS, and the client cannot
-    // render more than that either -- its own NUMGOSSIPBUTTONS is 32 as well -- so every add
-    // has to be able to refuse. `reserve` holds slots back for entries the menu is not usable
-    // without, such as the rename list's way out.
+    // A gossip menu holds 32 entries and the core asserts rather than truncating if you add a
+    // 33rd, so every single add in this file has to be able to say no. The client cannot draw
+    // more than 32 either, so there is nothing to be gained by trying.
+    //
+    // `reserve` holds slots back for entries the menu would be unusable without. The rename
+    // list uses it to guarantee room for its own Back button, because a submenu a player
+    // cannot leave is worse than one that is short an entry.
     bool CanAddMenuItem(Player* player, uint32 reserve = 0)
     {
         return player->PlayerTalkClass->GetGossipMenu().GetMenuItemCount() + reserve < GOSSIP_MAX_MENU_ITEMS;
     }
 
-    // Whether this module should take over an NPC's gossip.
+    // Whether this module should take over an NPC's menu at all.
     //
-    // A creature with a ScriptName is deliberately left alone. ScriptMgr::OnGossipHello asks
-    // every AllCreatureScript first and stops at the first one that returns true, so claiming
-    // a scripted banker would stop its CreatureScript from ever running -- and a menu that
-    // script builds in code, rather than in gossip_menu_option, cannot be carried across the
-    // rebuild. Losing a custom NPC's options is worse than that NPC having no vault list.
+    // A banker that has its own script attached is deliberately left completely alone. The
+    // core asks every module first and stops at the first one that claims the NPC, so taking
+    // one over would stop its own script from ever running. On top of that, a menu built in
+    // code rather than stored in the database cannot be read back and re-added, so the
+    // rebuild below would silently throw it away. An NPC without a vault list is a much
+    // smaller loss than an NPC whose custom behaviour has vanished.
     bool ClaimsBanker(Creature* creature)
     {
         return sExtendedBankConfig.IsEnabled()
@@ -74,33 +100,37 @@ namespace
             && !creature->GetScriptId();
     }
 
-    // Returns false when this player must not be offered a vault list on this creature. The
-    // menu is then left exactly as PrepareGossipMenu built it and nothing has been sent, so the
-    // caller can hand the NPC back to the core untouched.
+    // Builds and sends the vault list. Returns false when this player must not be offered one
+    // on this creature, having left the menu exactly as the core built it and sent nothing, so
+    // the caller can hand the NPC back and the result is identical to the module not existing.
     bool SendMainMenu(Player* player, Creature* creature)
     {
         ObjectGuid const playerGuid = player->GetGUID();
         std::vector<uint8> const owned = sExtendedBankMgr->GetOwnedVaults(playerGuid);
 
-        // Build whatever this NPC would normally offer, exactly as the default gossip path
-        // in NPCHandler does, so a banker that also innkeeps or vends keeps those options.
+        // Ask the core to build whatever this NPC would normally offer, exactly as it would
+        // without this module, so that a banker who is also an innkeeper or a vendor keeps
+        // those options. They are re-added below the vault list further down.
         player->PrepareGossipMenu(creature, creature->GetGossipMenuId(), true);
 
         GossipMenu& menu = player->PlayerTalkClass->GetGossipMenu();
         std::vector<CarriedGossipItem> carried;
 
-        // The vault list stands in for the stock banker option, so it may only be offered where
-        // that option was. PrepareGossipMenu drops an option whose `conditions` row fails
-        // (PlayerGossip.cpp:60), and GOSSIP_OPTION_BANKER has no other check, so a banker
-        // option surviving into the built menu is the core's own statement that this player may
-        // use this bank. Jeeves (35642) is the only creature in the stock database that gates
-        // one -- CONDITION_SKILL 202/350, Engineering 350 -- and without this the vault list
-        // handed his bank to anyone.
+        // The vault list stands in for the NPC's normal "let me see my bank" option, so it may
+        // only appear where that option would have. This is how the module inherits access
+        // rules for free rather than reimplementing them.
+        //
+        // The core has already dropped any option whose conditions this player fails, and the
+        // banker option has no further check beyond that, so one surviving into the built menu
+        // is the core stating that this player may bank here. In the stock game exactly one
+        // creature gates it: Jeeves, the engineering robot, who requires Engineering 350.
+        // Before this check existed the vault list handed his bank to anybody who could reach
+        // him.
         bool bankerOffered = false;
 
         for (auto const& menuPair : menu.GetMenuItems())
         {
-            // The vault list replaces the stock banker option; everything else is kept.
+            // The vault list replaces this one. Everything else the NPC offers is kept.
             if (menuPair.second.OptionType == GOSSIP_OPTION_BANKER)
             {
                 bankerOffered = true;
@@ -119,12 +149,13 @@ namespace
             carried.push_back(std::move(entry));
         }
 
-        // Nothing has been changed yet -- the loop above only read -- so the menu the core
-        // would have built is still intact for it to send.
+        // Nothing has been modified at this point, since the loop above only read, so the menu
+        // the core built is still sitting there intact and ready for it to send.
         if (!bankerOffered)
             return false;
 
-        // GossipMenu::ClearMenu leaves the quest menu alone, unlike ClearGossipMenuFor.
+        // This clears the options only. The other obvious call for this also wipes the quest
+        // list, which would make a banker who hands out quests stop offering them.
         menu.ClearMenu();
 
         for (uint8 vault : owned)
@@ -150,15 +181,17 @@ namespace
                 cost, false);
         }
 
-        // Shown even with only the default vault: naming it is useful on its own, and there is
-        // no reason the option should appear only after a purchase.
+        // Offered even to a player who owns nothing but their original bank. Naming it is
+        // useful on its own, and there is no reason to hide the option until after a
+        // purchase.
         if (CanAddMenuItem(player))
         {
             AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Rename and Reorder Vaults",
                 EXTENDED_BANK_SENDER, EXTENDED_BANK_ACTION_MANAGE_MENU);
         }
 
-        // Re-add the NPC's own options below the vault list, keeping their sub-menu links.
+        // Put the NPC's own options back, underneath the vault list, along with the links that
+        // make their submenus work.
         for (std::size_t i = 0; i < carried.size(); ++i)
         {
             CarriedGossipItem const& entry = carried[i];
@@ -185,10 +218,13 @@ namespace
         return true;
     }
 
-    // Renaming and reordering share one menu because they are the two things a player does to
-    // a vault rather than to its contents, and because the move entry has to sit next to the
-    // name it moves to be readable. They are otherwise unrelated: a move never touches a name
-    // and a rename never touches a position.
+    // Renaming and reordering share a submenu because they are the two things a player does
+    // to a vault rather than to what is inside it, and because a "move this up" entry is only
+    // readable when it sits next to the name of the thing it moves.
+    //
+    // They are otherwise completely independent. A move never touches a name, a rename never
+    // touches a position, and an unnamed vault keeps showing its number rather than its place
+    // in the list, so moving one vault can never look like it renamed another.
     void SendManageMenu(Player* player, Creature* creature)
     {
         ObjectGuid const playerGuid = player->GetGUID();
@@ -200,8 +236,9 @@ namespace
         {
             uint8 const vault = owned[index];
 
-            // One slot held back for "Back". A list the player cannot leave would be worse
-            // than one that is short a vault. Unreachable at a vault limit of 20, and free.
+            // Keep one slot for the Back button. A submenu the player cannot leave is worse
+            // than one missing an entry. With the vault limit at 20 this can never actually
+            // trigger, and it costs nothing to be certain.
             if (!CanAddMenuItem(player, 1))
                 break;
 
@@ -212,9 +249,10 @@ namespace
                 EXTENDED_BANK_SENDER, EXTENDED_BANK_ACTION_RENAME_BASE + vault,
                 Acore::StringFormat("Enter a new name for {}:", name), 0, true);
 
-            // Index 0 is the pinned default vault and index 1 sits directly below it, so
-            // neither has anywhere to go. Offering the option only where it does something is
-            // what keeps the top of the list from carrying a line that silently fails.
+            // The first entry is the pinned default vault, and the second sits directly below
+            // it, so neither has anywhere to move. Offering the option only where it does
+            // something keeps the top of the list from carrying a line that quietly does
+            // nothing when clicked.
             if (index < 2)
                 continue;
 
@@ -243,10 +281,12 @@ public:
         if (!ClaimsBanker(creature))
             return false;
 
-        // Returning false hands the NPC back to the core, which re-runs PrepareGossipMenu --
-        // idempotent, it opens with ClearMenus -- and then SendPreparedGossip, whose quest-menu
-        // fallback and menu-aware text id this module does not reproduce. Letting the core send
-        // it is what makes a refusal indistinguishable from the module not being installed.
+        // Returning false hands the NPC back to the core, which rebuilds the menu from
+        // scratch and sends it through its own path. That path has behaviour this module does
+        // not reproduce, such as falling back to the quest list and picking the right greeting
+        // text, so letting the core do it is what makes a refusal here completely
+        // indistinguishable from the module not being installed. Rebuilding is safe because
+        // it starts by clearing.
         return SendMainMenu(player, creature);
     }
 
@@ -259,8 +299,8 @@ public:
         {
             uint8 const vault = static_cast<uint8>(action - EXTENDED_BANK_ACTION_OPEN_BASE);
 
-            // On success the client closes the gossip frame itself when SMSG_SHOW_BANK
-            // arrives, which is exactly what the stock banker option relies on.
+            // No need to close the menu on success. The client closes it by itself when the
+            // bank window opens, which is exactly what the stock banker option relies on.
             if (!sExtendedBankMgr->OpenVault(player, vault, creature->GetGUID()))
                 CloseGossipMenuFor(player);
 
@@ -271,10 +311,10 @@ public:
         {
             uint8 const vault = static_cast<uint8>(action - EXTENDED_BANK_ACTION_MOVE_BASE);
 
-            // The return value is discarded for the same reason RenameVault's is: this menu
-            // only offers the option where it does something, so a false means a forged
-            // action against a call that has already declined to write anything. Redrawing
-            // shows the new order either way.
+            // The result is ignored on purpose. This menu only offers the option where it
+            // does something, so a refusal means somebody sent a crafted packet, and the call
+            // has already declined to write anything. Redrawing the menu is the right answer
+            // either way, and shows the new order when there is one.
             sExtendedBankMgr->MoveVaultUp(player, vault);
             SendManageMenu(player, creature);
             return true;
@@ -282,10 +322,11 @@ public:
 
         switch (action)
         {
-            // A refusal here can only mean the player stopped meeting the banker option's
-            // conditions while the menu was open -- unlearning Engineering at Jeeves, say. The
-            // menu is already ours at this point and the core will not send anything, so close
-            // it rather than leave a stale one on screen.
+            // Getting here means the player stopped qualifying for the banker option while
+            // the menu was already open, which in the stock game means unlearning Engineering
+            // while standing in front of Jeeves. The menu already belongs to this module by
+            // now and the core will not send a replacement, so close it rather than leave a
+            // stale one on screen.
             case EXTENDED_BANK_ACTION_BUY:
                 sExtendedBankMgr->BuyNextVault(player);
                 if (!SendMainMenu(player, creature))
@@ -316,9 +357,9 @@ public:
         {
             uint8 const vault = static_cast<uint8>(action - EXTENDED_BANK_ACTION_RENAME_BASE);
 
-            // The return value is discarded deliberately: this menu only ever lists vaults the
-            // character owns, so a false here means a forged action, and RenameVault has
-            // already declined to write anything. Redrawing the menu is the right answer.
+            // The result is ignored on purpose. This menu only ever lists vaults the character
+            // owns, so a refusal means a crafted packet, and the rename has already declined
+            // to write anything. Redrawing the menu is the right answer.
             sExtendedBankMgr->RenameVault(player, vault, code ? code : "");
             SendManageMenu(player, creature);
             return true;
@@ -329,15 +370,21 @@ public:
     }
 };
 
-// This hook does two unrelated jobs, both of which need to happen before a packet handler runs.
+// Two unrelated jobs share this hook, because both have to happen before any packet is
+// handled and this is the only place that runs there.
 //
-// First, most bankers carry UNIT_NPC_FLAG_BANKER without UNIT_NPC_FLAG_GOSSIP. For those the
-// client never sends CMSG_GOSSIP_HELLO on right-click -- it sends CMSG_BANKER_ACTIVATE and the
-// stock handler answers with SMSG_SHOW_BANK, so CanCreatureGossipHello above is never reached
-// and the bank frame opens with no menu at all. Intercepting that opcode is what puts the vault
-// menu in front of it, without altering any creature's npcflags.
+// The first is getting the menu in front of the player at all. Most bankers are flagged as
+// bankers without being flagged as talkers, and for those the client never asks for a
+// conversation. Right-clicking sends "open my bank" straight to the server, the core answers
+// by opening the bank window, and no gossip code runs anywhere along the way. Catching that
+// one packet and answering with a menu instead is the only way in.
 //
-// Second, it drains the live vault out of the item update queue. See DrainUpdateQueue below.
+// The alternative would be adding the talk flag to every banker at runtime, which was
+// rejected: the core writes that flag back to the world database when a GM saves a creature,
+// so it would quietly become permanent on somebody's realm.
+//
+// The second job is the drain described at the top of ExtendedBank.h, and it is the reason
+// every other packet passes through here too.
 class ExtendedBankPacketScript : public ServerScript
 {
 public:
@@ -383,26 +430,33 @@ public:
         if (packet.size() < sizeof(uint64))
             return true;
 
-        // Same guard the stock handler applies before opening the bank.
+        // Exactly the check the core makes before opening a bank: the creature exists, is a
+        // banker, and is close enough to talk to. Repeating it rather than trusting the packet
+        // is what stops a crafted one opening a bank from across the map.
         ObjectGuid const bankerGuid(packet.read<uint64>(0));
         Creature* creature = player->GetNPCIfCanInteractWith(bankerGuid, UNIT_NPC_FLAG_BANKER);
         if (!creature || !ClaimsBanker(creature))
             return true;
 
-        // The parts of HandleGossipHelloOpcode that matter for a menu being shown at all.
+        // The two things the core does before showing any menu, which matter here because
+        // this path bypasses the code that would normally do them: break stealth-style auras
+        // that end when you talk to someone, and stop the NPC wandering off mid-conversation.
         player->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TALK);
         creature->PauseMovementForInteraction();
 
-        // A creature reaching this path has no gossip flag, so its banker option comes from the
-        // default menu 0 fallback, which carries no conditions -- the check passes for every
-        // plain banker. If it ever does not, letting the packet through to the stock handler is
-        // the correct answer: WorldSession::HandleBankerActivateOpcode tests nothing but
-        // CanUseBank, so the core would open that bank too, and refusing here would be stricter
-        // than the game.
+        // Any creature arriving here has no menu of its own, so its banker option comes from
+        // a default that carries no conditions, and the access check inside will pass for
+        // every ordinary banker.
+        //
+        // If it ever does not, letting the packet continue to the core is the right answer
+        // rather than refusing. The core's own handler checks nothing except whether the
+        // player may use a bank, so it would open this one regardless, and refusing here would
+        // make the module stricter than the game itself.
         if (!SendMainMenu(player, creature))
             return true;
 
-        // Swallow the packet: the bank frame is opened from the vault the player picks.
+        // Swallow the packet so the core never opens the bank. From here on the bank window
+        // is opened by whichever vault the player picks out of the menu.
         return false;
     }
 };

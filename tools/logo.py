@@ -2,7 +2,8 @@ r"""Draws images/logo.png.
 
     uv run --quiet --with pillow python .\logo.py
 
-Kept for the fun of it, and because a logo nobody can regenerate is a logo nobody can
+Kept for the fun of it, a testament of insanity produced by a simple request "Hey LLM, draw me a simple logo",
+and because a logo nobody can regenerate is a logo nobody can
 change. It will not run on a fresh clone without editing MPQ below: it reads two assets
 straight out of an extracted client, and neither is redistributed here.
 

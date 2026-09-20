@@ -12,10 +12,10 @@
 #include "Tokenize.h"
 #include <algorithm>
 
-// A throwing constructor at namespace scope cannot be caught, and this one can technically
-// throw: ConfigValueCache's constructor resizes a vector. Four elements, before the world
-// exists, on a path where a bad_alloc would end the process anyway -- and this is the shape
-// every AzerothCore config singleton has. Left as it is on purpose.
+// A constructor running at namespace scope can throw where nothing can catch it, and this one
+// technically can, because it sizes a vector. Four elements, before the world exists, on a
+// path where running out of memory would end the process anyway. This is also the shape every
+// config singleton in AzerothCore has. Left alone on purpose.
 // NOLINTNEXTLINE(bugprone-throwing-static-initialization)
 ExtendedBankConfig sExtendedBankConfig;
 
@@ -23,15 +23,17 @@ void ExtendedBankConfig::BuildConfigCache()
 {
     SetConfigValue<bool>(ExtendedBankSetting::ENABLE, "ExtendedBank.Enable", true);
     SetConfigValue<uint32>(ExtendedBankSetting::MAX_VAULTS, "ExtendedBank.MaxVaults", 8);
-    // Must stay identical to conf/mod_extended_bank.conf.dist: an administrator who never
-    // copies the .conf.dist gets this list, and a mismatch silently reprices the feature.
+    // These defaults must stay identical to the ones in the shipped config file. An
+    // administrator who never copies that file gets these instead, so if the two drift apart
+    // the feature quietly costs a different amount depending on whether somebody copied a
+    // file.
     SetConfigValue<std::string>(ExtendedBankSetting::VAULT_COST, "ExtendedBank.VaultCost",
         "100,1000,2500,6000,18000,38000,90000");
     SetConfigValue<bool>(ExtendedBankSetting::ALLOW_RESTRICTED_ITEMS, "ExtendedBank.AllowRestrictedItems", false);
 
-    // Said out loud on every startup and every reload, because it is the one setting here that
-    // changes what the realm's rules are rather than how the feature is priced or sized, and
-    // because a realm that has it on by accident has no other symptom to notice.
+    // Announced on every startup and every reload, because this is the one setting here that
+    // changes what the realm treats as an exploit rather than what the feature costs or how
+    // big it is. A realm running with it on by accident has no other symptom to notice.
     if (GetConfigValue<bool>(ExtendedBankSetting::ALLOW_RESTRICTED_ITEMS))
     {
         LOG_WARN("module.extendedbank",
@@ -55,8 +57,9 @@ void ExtendedBankConfig::BuildConfigCache()
     {
         if (Optional<uint32> gold = Acore::StringTo<uint32>(token))
         {
-            // *gold * EXTENDED_BANK_COPPER_PER_GOLD wraps a uint32 above 429,496 gold, which
-            // would turn an absurd price into a cheap one with no warning at all.
+            // Converting gold to copper overflows above about 429,496 gold, and an overflow
+            // here turns an absurd price into a cheap one silently. A typo in the config would
+            // then hand out vaults for pocket change instead of refusing to sell them.
             if (*gold > EXTENDED_BANK_MAX_VAULT_COST_GOLD)
             {
                 LOG_ERROR("module.extendedbank",

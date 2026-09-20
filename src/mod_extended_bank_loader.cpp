@@ -10,8 +10,12 @@ void AddExtendedBankGossipScripts();
 void AddExtendedBankCommandScripts();
 void AddExtendedBankPlayerScripts();
 
-// The loader name is derived from the module directory by modules/CMakeLists.txt:
-// every '-' becomes '_', so mod-extended-bank must export Addmod_extended_bankScripts().
+// The one function AzerothCore calls to start this module, and the only symbol it looks for.
+//
+// The name is not a choice. The build system derives it from the directory name by replacing
+// every hyphen with an underscore, so a module in mod-extended-bank must export exactly
+// Addmod_extended_bankScripts(). Rename the directory and this has to change with it, or the
+// build fails at the very last step with an unresolved symbol.
 void Addmod_extended_bankScripts()
 {
     AddExtendedBankConfigScripts();

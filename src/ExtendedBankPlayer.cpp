@@ -5,14 +5,25 @@
  * AzerothCore. See LICENSE in the root of this repository.
  */
 
+/*
+ * Where the module attaches to a character's life: logging in, being updated each tick,
+ * changing map, being saved, logging out, and being deleted.
+ *
+ * Every hook here is one line handing off to the manager. The value is in the choice of hook
+ * rather than in the code, so each comment explains why that particular moment and not
+ * another one.
+ */
+
 #include "ExtendedBank.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 
-// No hook here is gated on the enable switch. ExtendedBank.Enable is hot-reloadable, so a
-// character can log in while the module is off and be playing when it is switched on; gating
-// the login hook would leave that character with no vault list in memory, and the gossip menu
-// would then offer to sell them a vault they already own.
+// Deliberately none of these check whether the module is switched on.
+//
+// The enable setting can be changed without restarting the server, so a character can log in
+// while the module is off and still be playing when somebody turns it on. Had the login hook
+// checked, that character would have no vault list loaded, and the menu would cheerfully
+// offer to sell them a vault they already own.
 class ExtendedBankPlayerScript : public PlayerScript
 {
 public:
@@ -26,16 +37,21 @@ public:
         PLAYERHOOK_ON_DELETE_FROM_DB
     }) { }
 
-    // Runs before Player::_LoadInventory, which is the only window in which the bank bag
-    // slot count can still be corrected without the core mailing bank bags back.
+    // This runs before the core loads the character's items, which is the only moment the
+    // bank bag slot count can still be put right. Miss it and the core finds more bags than
+    // slots and posts the difference to the player. See LoadPlayer for why that number can be
+    // wrong in the first place.
     void OnPlayerLoadFromDB(Player* player) override
     {
         sExtendedBankMgr->LoadPlayer(player);
     }
 
-    // Player::Update calls this at PlayerUpdates.cpp:315 and UpdateAdditionalSaves -- which
-    // reaches _SaveInventory without firing OnPlayerSave -- at :340, so draining here closes
-    // the periodic-save path.
+    // The per-tick hook, and it is here for a specific reason rather than for tidiness. A few
+    // lines after this fires, the same core function runs a periodic inventory save that does
+    // not announce itself through any hook at all. Draining here is what gets in front of it.
+    //
+    // The range check shares the hook because this is also the only place that runs often
+    // enough to notice a player walking away from a banker.
     void OnPlayerUpdate(Player* player, uint32 p_time) override
     {
         sExtendedBankMgr->DrainUpdateQueue(player);
@@ -47,16 +63,18 @@ public:
         sExtendedBankMgr->RevertToDefaultVault(player);
     }
 
-    // Fires from Player::SaveToDB before _SaveInventory, which is what lets the module take
-    // its items out of the update queue before the core would write them into
-    // character_inventory.
+    // Fires during a full character save, and crucially before the part that writes the
+    // inventory, so the module gets to take its items off the pending-write list first. The
+    // ordering is the whole reason this hook is useful.
     void OnPlayerSave(Player* player) override
     {
         sExtendedBankMgr->FlushActiveVault(player);
     }
 
-    // Fires at the very start of WorldSession::LogoutPlayer, before the final SaveToDB, so
-    // the character is always saved with an empty bank and the default vault's bag slot count.
+    // Fires at the very start of logging out, before the final save, so the character record
+    // that reaches disk always describes an empty bank and vault 1's bag slot count. That is
+    // what makes a logged-out character indistinguishable from one on a realm without this
+    // module.
     void OnPlayerBeforeLogout(Player* player) override
     {
         sExtendedBankMgr->FlushAndDetachForLogout(player);

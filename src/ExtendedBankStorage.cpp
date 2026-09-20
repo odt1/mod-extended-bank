@@ -6,12 +6,27 @@
  */
 
 /*
- * The live bank: attaching a vault into the player's real bank slots, detaching it again, and
- * every write that decides which table an item belongs to.
+ * This file moves items in and out of the character's bank slots, and it is the only file in
+ * the module that creates, places or destroys an item. If you are looking for the code that
+ * could lose somebody's belongings, it is all here.
  *
- * The invariant the whole module serves lives in this file. Vault 1 IS `character_inventory`;
- * vaults 2..N are `mod_extended_bank_vault_items`; nothing ever moves between the two tables.
- * ExtendedBankVaults.cpp holds the metadata table and the queries, none of which touch an item.
+ * Read the block at the top of ExtendedBank.h first. The short version: the character's bank
+ * slots are a fixed piece of memory that the core believes is their one real bank. Opening a
+ * second vault means emptying those slots and filling them from the module's own table, while
+ * making very sure the core never saves what it finds there.
+ *
+ * Three jobs, which the sections below follow:
+ *
+ *   attach   load a vault's rows from the database into the bank slots
+ *   detach   take them back out and free them
+ *   flush    write down where everything ended up
+ *
+ * Flushing is the subtle one. It has to write the module's rows and, when an item has left the
+ * vault, get the core to write its row too, both inside a single transaction. Split them and
+ * an item briefly belongs to neither table, which a crash turns into a lost item.
+ *
+ * ExtendedBankVaults.cpp is the quiet counterpart: names, prices, menu order, and nothing that
+ * can touch an item.
  */
 
 #include "ExtendedBank.h"
@@ -43,9 +58,10 @@ ExtendedBankMgr* ExtendedBankMgr::instance()
 
 namespace
 {
-    // The 11 item_instance columns Item::LoadFromDB expects in fields[0..10], in order,
-    // followed by bag / slot / item guid / entry in fields[11..14]. Same shape as the core
-    // CHAR_SEL_CHARACTER_INVENTORY projection.
+    // The core's item loader reads its fields by position, not by name, so any query feeding
+    // it has to produce exactly these columns in exactly this order. Copied from the core's
+    // own inventory query for that reason. Reordering them here would not fail; it would
+    // quietly load the wrong value into every item.
     constexpr char const* ITEM_INSTANCE_COLUMNS =
         "ii.creatorGuid, ii.giftCreatorGuid, ii.count, ii.duration, ii.charges, ii.flags, "
         "ii.enchantments, ii.randomPropertyId, ii.durability, ii.playedTime, ii.text";
@@ -59,13 +75,16 @@ void ExtendedBankMgr::ReleaseItem(Player* player, Item* item)
 {
     item->RemoveFromUpdateQueueOf(player);
 
-    // Both are erase-if-present, so calling this after Player::RemoveItem -- which does
-    // RemoveTradeableItem itself, but not DeleteRefundReference -- costs nothing. Doing both
-    // is what makes the call safe on an item that never reached a slot: AttachVault runs
-    // RestoreItemSideData *before* the placement attempt, so an item that then fails to place
-    // is already registered in one or both. Left behind, the refund GUID makes _SaveInventory
-    // complain every save, and the trade-list pointer is walked once a second by
-    // Player::UpdateSoulboundTradeItems for an item that by then lives in the mail.
+    // An item can be registered in two lists that outlive the slot it sits in: one tracking
+    // what is still inside its refund window, one tracking what can still be traded to the
+    // other players who were present when it dropped. Both removals do nothing if the item was
+    // never listed, which is what lets this run unconditionally.
+    //
+    // Both are needed because loading a vault registers an item in these lists *before* trying
+    // to put it in a slot, so an item that then fails to place is already in them. A refund
+    // entry left behind makes every later save complain about an item that is no longer there.
+    // A trade entry left behind means the server walks a pointer to freed memory once a
+    // second.
     player->DeleteRefundReference(item->GetGUID());
     player->RemoveTradeableItem(item);
 
@@ -85,10 +104,14 @@ void ExtendedBankMgr::MarkClean(Player* player, Item* item)
 void ExtendedBankMgr::MailItemsBack(Player* player, std::vector<Item*>& items,
     CharacterDatabaseTransaction trans, char const* subject, char const* body)
 {
-    // MAX_MAIL_ITEMS is 12 and a full vault holds up to 280, so this has to be able to send
-    // more than one letter. Always mailed in the caller's transaction, never one of its own:
-    // the same commit has to carry whatever row change took these items out of the bank, or a
-    // crash between the two commits leaves an item in mail_items and in a vault at once.
+    // A letter holds twelve items and a full vault holds up to 280, so one call here can turn
+    // into a stack of letters.
+    //
+    // It writes into the caller's transaction rather than opening its own, and that is not
+    // tidiness. The same commit has to carry both the mail and whatever change removed these
+    // items from the vault. Kept apart, a crash landing between the two commits leaves the
+    // item posted to the player *and* still listed in the vault, which becomes a duplicate the
+    // moment they open it.
     for (std::size_t sent = 0; sent < items.size(); )
     {
         MailDraft draft(subject, body);
@@ -112,9 +135,11 @@ void ExtendedBankMgr::CollectLiveBankItems(Player* player, std::vector<ExtendedB
         if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
             items.push_back({ item, 0, slot });
 
-    // Each bank bag is followed immediately by its own contents, so walking the result
-    // forwards places bags before their items and walking it backwards removes the items
-    // before their bag.
+    // Order matters to every caller, and this is the one place it is decided. Each bag is
+    // emitted immediately before the items inside it, so reading the list forwards places a
+    // bag before anything that belongs in it, and reading it backwards empties a bag before
+    // removing the bag itself. Get this wrong and loading a vault tries to put items into a
+    // container that does not exist yet.
     for (uint8 slot = BANK_SLOT_BAG_START; slot < BANK_SLOT_BAG_END; ++slot)
     {
         Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
@@ -145,17 +170,20 @@ void ExtendedBankMgr::PersistVaultLayout(Player* player, uint8 vault,
 
     if (vault != EXTENDED_BANK_DEFAULT_VAULT)
     {
-        // Only the rows that actually changed are touched. This used to delete the whole vault
-        // and re-insert every item on any change at all, which is two statements per item --
-        // over 500 of them for a single drag inside a full vault, every one of which had to be
-        // parsed and executed on the async worker for a layout that differed in one row.
+        // Only the rows that actually changed are written. An earlier version deleted the
+        // whole vault and re-inserted every item on any change at all, so dragging a single
+        // item inside a full vault cost over five hundred statements to record a difference of
+        // one row.
         //
-        // Every row about to move is deleted before any of them is written back. Two items
-        // swapping places inside a vault would otherwise collide on
-        // UNIQUE KEY (owner_guid, vault, bag, slot): the first INSERT would land on a slot its
-        // previous occupant has not vacated yet, and abort the whole transaction. A row left
-        // untouched cannot collide with one that moved, because a position only becomes
-        // available when whatever held it is itself in this delete list.
+        // Every row that is about to move is deleted before any row is written back, and that
+        // ordering is load-bearing. Swapping two items means writing each to a position the
+        // other currently occupies. Interleave the deletes and inserts and the first insert
+        // lands on a slot its previous occupant has not vacated, the unique key on
+        // (owner, vault, bag, slot) rejects it, and the entire transaction is rolled back.
+        // Because the write is committed in the background there is nothing to see in game:
+        // the vault simply appears to forget the player's last drag. A row nobody touched
+        // cannot trigger this, since a slot only frees up when whatever held it is itself in
+        // the delete list.
         std::string doomed;
 
         auto const addDoomed = [&doomed](ObjectGuid::LowType itemGuid)
@@ -174,17 +202,17 @@ void ExtendedBankMgr::PersistVaultLayout(Player* player, uint8 vault,
 
         if (!doomed.empty())
         {
-            // Keyed on the item alone, deliberately: PRIMARY KEY is (item), item GUIDs are
-            // globally unique, and this statement is the module claiming them. A row left for
-            // one of these items under a different vault -- or under a different owner, which
-            // a crash during a character delete plus GUID reuse can produce -- would survive
-            // any narrower delete and then abort the INSERT on the primary key.
+            // Deliberately keyed on the item alone rather than on owner and vault. Item GUIDs
+            // are unique across the whole server, so this says "whatever else the database
+            // believes about these items, forget it". A stale row filing one of them under
+            // another vault, or under another character after a deletion recycled the GUID,
+            // would survive a narrower delete and then collide with the insert below.
             //
-            // The predecessor of this code used ON DUPLICATE KEY UPDATE for that instead. It
-            // is not used here because this table has a second unique key on
-            // (owner_guid, vault, bag, slot): an upsert that collided on *that* one would
-            // quietly repoint an existing row at a different item, which loses an item, where
-            // aborting the transaction only loses the flush and is repaired at next login.
+            // The obvious alternative, an upsert, is worse here. This table carries a second
+            // unique key on (owner, vault, bag, slot), and an upsert colliding on *that* key
+            // would quietly repoint an existing row at a different item. That loses an item.
+            // Letting the transaction abort instead loses only the last edit, and login
+            // repairs it.
             trans->Append("DELETE FROM mod_extended_bank_vault_items WHERE item IN ({})", doomed);
         }
 
@@ -206,29 +234,37 @@ void ExtendedBankMgr::PersistVaultLayout(Player* player, uint8 vault,
                 "VALUES {}", values);
         }
 
-        // The module now owns these items' positions, so any character_inventory row still
-        // describing where they used to sit has to go. This is delete-by-item-GUID, the very
-        // call mail, auction and the guild bank make when an item leaves a player's
-        // inventory; it can never touch the default vault's rows, because the default vault's
-        // items are not live while another vault is open. Only items that were not already in
-        // this vault at the last flush need it -- the ones that were had their row deleted
-        // then, and have had no inventory position since.
+        // These items have just become the module's responsibility, so the core's record of
+        // where they used to be has to go. This is the same delete-by-item call that mail, the
+        // auction house and the guild bank each make when an item leaves a player's hands, so
+        // it is a well-trodden path rather than something the module invented.
+        //
+        // It cannot reach vault 1's rows even by accident, because vault 1's items are not
+        // loaded while another vault is open. And only items that were somewhere else at the
+        // last save need it: anything already in this vault had its row deleted back then, and
+        // has had no inventory position since.
         for (std::size_t index : delta.Entered)
             items[index].ItemPtr->DeleteFromInventoryDB(trans);
     }
 
-    // item_instance has to be written for every vault, the default one included: the Item
-    // objects are about to be freed and durability, charges or stack size may have changed
-    // this session. Un-queueing first is what stops the core's _SaveInventory from writing
-    // these items back into character_inventory.
+    // Every vault reaches this, vault 1 included. The item objects are about to be destroyed,
+    // and their durability, charges or stack size may have changed since they were loaded, so
+    // those have to be written down or the changes die with the objects.
+    //
+    // The removal on the first line is the important half. It takes each item off the list the
+    // core saves from, so that when the core next writes this character's inventory it does
+    // not see these items at all. That is the whole defence described at the top of
+    // ExtendedBank.h, and it is one line.
     for (ExtendedBankItemPos const& pos : items)
     {
         pos.ItemPtr->RemoveFromUpdateQueueOf(player);
         pos.ItemPtr->SaveToDB(trans);
     }
 
-    // In this transaction, not on its own: a bag slot bought moments ago and the rows of the
-    // bag that went into it have to become true together.
+    // Joined to this transaction rather than sent separately, so that a bank bag slot bought
+    // moments ago and the bag now sitting in it become true at the same instant. Apart, a
+    // crash between the two leaves a bag in a slot the character does not own, and the core
+    // mails it back at the next login.
     SyncVaultBagSlots(player, vault, trans);
 }
 
@@ -250,9 +286,10 @@ ExtendedBankLayoutDelta ExtendedBankMgr::ComputeLayoutDelta(ExtendedBankSession 
     ExtendedBankLayoutDelta delta;
     delta.BagSlotsChanged = session.PersistedBagSlots != bagSlots;
 
-    // Indexed by item GUID rather than by position, so an item that merely moved is told apart
-    // from one that entered or left. What is left in the map once every live item has been
-    // looked up is, by definition, what the vault no longer holds.
+    // Keyed on the item rather than on the slot, which is what tells an item that moved
+    // within the vault apart from one that arrived or left. Each live item is looked up and
+    // then struck off, so whatever remains in the map at the end is exactly what the vault
+    // used to hold and no longer does. No second scan needed to find it.
     std::unordered_map<ObjectGuid::LowType, ExtendedBankPersistedPos const*> was;
     was.reserve(session.PersistedLayout.size());
 
@@ -295,18 +332,21 @@ bool ExtendedBankMgr::AnyItemQueued(std::vector<ExtendedBankItemPos> const& item
 
 void ExtendedBankMgr::DetachLiveBank(Player* player, std::vector<ExtendedBankItemPos> const& items)
 {
-    // Reverse order: a bag's contents must leave before the bag itself.
+    // Backwards through the list, which by the ordering established in CollectLiveBankItems
+    // empties each bag before removing the bag.
     for (auto itr = items.rbegin(); itr != items.rend(); ++itr)
     {
         Item* item = itr->ItemPtr;
 
-        // Player::RemoveItem only touches memory and the client's update fields; it never
-        // changes Item::uState, so an unchanged item costs no database write here.
+        // Removing an item this way is free. It touches memory and the client's view only,
+        // and never marks the item as needing a write, so emptying the bank slots costs
+        // nothing in database terms. That is what makes switching vaults cheap enough to do
+        // every time somebody walks away from a banker.
         //
-        // update = false because with update = true the call ends in
-        // pItem->SendUpdateToPlayer(this) (PlayerStorage.cpp:3073) -- a full create-object
-        // block for an item that is about to be destroyed on the very next line. The slot
-        // GUIDs it clears are still pushed, as one batch, by OpenVault's SendUpdateToPlayer.
+        // The `false` suppresses a per-item update packet. With it set, the core would build
+        // and send a full description of an item that is destroyed on the very next line. The
+        // client still learns the slots are empty: OpenVault pushes all of them together once
+        // the swap has finished.
         player->RemoveItem(item->GetBagSlot(), item->GetSlot(), false);
         ReleaseItem(player, item);
 
@@ -385,8 +425,11 @@ QueryResult ExtendedBankMgr::QueryVaultContents(ObjectGuid::LowType lowGuid, uin
 {
     if (vault == EXTENDED_BANK_DEFAULT_VAULT)
     {
-        // The default vault is simply the bank half of character_inventory: the top level
-        // bank slots, plus everything sitting inside a bag that occupies a bank bag slot.
+        // Vault 1 has no table of its own, so "read vault 1" means reading the bank-shaped
+        // part of the core's inventory table: the bank slots themselves, plus the contents of
+        // any bag sitting in one of the bank's bag slots. The self-join is what finds that
+        // second part, since a bag's contents record only which bag they are in and not where
+        // that bag is.
         return CharacterDatabase.Query(
             "SELECT {}, ci.bag, ci.slot, ci.item, ii.itemEntry "
             "FROM character_inventory ci "
@@ -401,10 +444,11 @@ QueryResult ExtendedBankMgr::QueryVaultContents(ObjectGuid::LowType lowGuid, uin
             uint32(BANK_SLOT_BAG_START), uint32(BANK_SLOT_BAG_END));
     }
 
-    // No self-heal here: it reads character_inventory on a synchronous connection while this
-    // module's deletes of those same rows are committed asynchronously, so mid-session it can
-    // see a row whose deletion is still queued and destroy a valid vault row.
-    // SelfHealVaultRows runs once per login instead, where nothing is in flight.
+    // Deliberately no consistency check here, tempting as it is. Reads and writes travel over
+    // different database connections and the module's writes commit in the background, so a
+    // check run mid-session can see a row whose deletion is still sitting in a queue. It would
+    // then "repair" a vault row that was perfectly valid. The equivalent check runs once at
+    // login instead, when nothing is in flight.
     return CharacterDatabase.Query(
         "SELECT {}, v.bag, v.slot, v.item, ii.itemEntry "
         "FROM mod_extended_bank_vault_items v "
@@ -418,8 +462,10 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
 {
     ObjectGuid const playerGuid = player->GetGUID();
 
-    // Records what is now live so the first flush of this vault can tell that nothing moved,
-    // and pins the session's idea of which vault it holds before anything else can read it.
+    // Called once the bank slots are filled. It writes down which vault is now open and what
+    // it looked like on arrival, so the next save can tell "the player moved something" from
+    // "nothing has happened since I loaded this" without asking the database. A player parked
+    // at a banker doing nothing is the common case, and this is what makes it free.
     auto const openSession = [&](std::vector<ExtendedBankItemPos> const& attached)
     {
         if (vault == EXTENDED_BANK_DEFAULT_VAULT)
@@ -435,7 +481,8 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
 
     if (!result)
     {
-        // An empty vault is still a known state; record it so the first flush can skip.
+        // An empty vault is a perfectly good state and still needs recording, otherwise the
+        // first save cannot tell it apart from a vault whose contents have not loaded.
         openSession({});
         return;
     }
@@ -445,8 +492,9 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
     std::set<ObjectGuid::LowType> unusableBags;
     std::vector<Item*> problematicItems;
 
-    // Removes an item's position row from whichever table owns this vault. Every early exit
-    // below has to call it, or the row survives and the same failure repeats on every open.
+    // Forgets where an item was, in whichever of the two tables owns this vault. Every failure
+    // path below has to call it. Skip it and the bad row stays in the database, so the same
+    // failure repeats every single time the player opens this vault, forever.
     auto dropRow = [&](ObjectGuid::LowType guid)
     {
         if (vault != EXTENDED_BANK_DEFAULT_VAULT)
@@ -467,8 +515,10 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
         ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
         if (!proto)
         {
-            // Same treatment Player::_LoadItem gives an unknown entry: drop the position row
-            // and the item_instance row, so the error is not repeated on every future open.
+            // The item refers to a template the server does not have, usually because a
+            // custom item was removed from the database. There is nothing to load, so follow
+            // what the core does in the same situation and delete both the position and the
+            // item itself, rather than logging the same error on every future visit.
             LOG_ERROR("module.extendedbank", "Player {} has unknown item entry {} in vault {}, removing.",
                 playerGuid.ToString(), itemEntry, vault);
             dropRow(itemGuid);
@@ -483,8 +533,8 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
                 playerGuid.ToString(), itemEntry, vault);
             dropRow(itemGuid);
 
-            // Item::SaveToDB deletes the object itself on ITEM_REMOVED (Item.cpp:407), so
-            // there must be no delete of our own here.
+            // Marking an item removed and saving it makes the core destroy the object for us.
+            // Deleting it here as well would be a double free.
             item->FSetState(ITEM_REMOVED);
             item->SaveToDB(trans);
             continue;
@@ -527,9 +577,11 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
             auto const bagItr = bagMap.find(bagGuid);
             if (bagItr == bagMap.end())
             {
-                // Either the bag row is missing entirely, or the bag itself could not be
-                // placed and was mailed back. Mail the contents too rather than dropping the
-                // Item and leaving its row behind to fail again on every future open.
+                // This item claims to live inside a bag that is not here. Either the bag's
+                // own row is missing, or the bag failed to fit and has already been posted to
+                // the player. Either way the contents follow it into the mail. Dropping them
+                // instead would leave their rows behind to fail again on every future visit,
+                // and the player would never see the items again.
                 if (unusableBags.find(bagGuid) == unusableBags.end())
                 {
                     LOG_ERROR("module.extendedbank",
@@ -559,8 +611,9 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
 
         if (err == EQUIP_ERR_OK)
         {
-            // Cancels the ITEM_CHANGED that storing just queued, the same way
-            // Player::_LoadInventory does, so nothing ever reaches character_inventory.
+            // Putting an item in a slot marks it as needing a write. Undo that immediately,
+            // exactly as the core does after loading an item from the database, because a
+            // write here would put a vault item into the character's real inventory.
             MarkClean(player, item);
         }
         else
@@ -578,11 +631,13 @@ void ExtendedBankMgr::AttachVault(Player* player, uint8 vault)
     MailItemsBack(player, problematicItems, trans,
         "Bank vault", "Some items could not be placed back into your bank.");
 
-    // Un-queueing each item as it was stored is not enough on its own: Player::_StoreItem
-    // marks the *containing bag* ITEM_CHANGED as well, so every bank bag is pushed back into
-    // the update queue by the first item stored into it. The core sidesteps this by holding
-    // m_itemUpdateQueueBlocked across the whole of _LoadInventory, which is private, so the
-    // module sweeps the finished bank instead.
+    // Cleaning each item as it was placed is not enough, and this sweep is the reason why.
+    // Putting an item into a bag marks the *bag* as changed too, so the first item stored into
+    // each bank bag dirties the bag again behind us. The core avoids the problem by switching
+    // the whole mechanism off while it loads a character, using a flag the module cannot
+    // reach, so the module walks the finished bank once more instead.
+    //
+    // Miss this and the bags themselves get written into the character's real inventory.
     std::vector<ExtendedBankItemPos> attached;
     CollectLiveBankItems(player, attached);
 
@@ -602,10 +657,13 @@ void ExtendedBankMgr::PersistOutgoingVault(Player* player, uint8 vault)
 {
     if (vault != EXTENDED_BANK_DEFAULT_VAULT)
     {
-        // A non-default vault is live only through a session -- GetActiveVault reads nothing
-        // else -- so this lookup cannot miss for a vault the caller found active. The Item
-        // objects are about to be freed, which makes this one of the two places the core's
-        // inventory save is both needed and safe.
+        // A vault other than the first is only ever open by way of a session, so if the
+        // caller found one active then the lookup below cannot fail.
+        //
+        // The `true` pulls the core's own inventory save into the same transaction. That is
+        // expensive and has side effects, so it happens in only two places in the module, both
+        // of them moments before the item objects are destroyed. Here is one of them: after
+        // this, anything not written down is gone.
         auto const itr = _sessions.find(player->GetGUID());
         if (itr != _sessions.end())
             FlushLiveVault(player, itr->second, true);
@@ -613,16 +671,16 @@ void ExtendedBankMgr::PersistOutgoingVault(Player* player, uint8 vault)
         return;
     }
 
-    // A bank bag slot bought while this vault was open lives only in PLAYER_BYTES_2 --
-    // HandleBuyBankSlotOpcode writes no row -- and SwitchTo is about to overwrite the live
-    // count with the incoming vault's. Capture it before that happens or the purchase, and the
-    // gold, are silently lost, and any bag already placed in that slot is mailed back on the
-    // way in.
+    // Buying a bank bag slot only changes a counter on the character in memory. Nothing
+    // writes it down, and the switch that is about to happen will overwrite that counter with
+    // the incoming vault's. Record it here or the player's gold is gone and the slot is not,
+    // and any bag they already put in that slot gets mailed back to them on the way in.
     SyncVaultBagSlots(player, vault);
 
-    // The default vault IS character_inventory, so the core owns its positions. An item the
-    // player rearranged inside the vanilla bank is queued and nowhere else; without this its
-    // new slot would be lost when DetachLiveBank frees the Item.
+    // Vault 1's positions belong to the core, so the module cannot write them itself. An item
+    // the player has just rearranged inside their normal bank exists only as a pending change
+    // in memory, and the next step destroys the objects holding it. Asking the core to save
+    // now is the only way that rearrangement survives.
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
     player->SaveInventoryAndGoldToDB(trans);
     CharacterDatabase.CommitTransaction(trans);
@@ -638,12 +696,15 @@ void ExtendedBankMgr::SwitchTo(Player* player, uint8 target)
 
     EnsureDefaultVaultRow(player);
 
-    // Everything the outgoing vault owns has to be on disk before its Item objects are freed.
-    // Player::SaveToDB is deliberately NOT used for that: it returns without doing anything,
-    // and without firing OnPlayerSave, while a far teleport is pending, which would leave this
-    // code deleting items whose changes -- or, for ITEM_NEW, whose entire existence -- were
-    // never written. Player::SaveInventoryAndGoldToDB has no such guard and is exactly the
-    // half that matters here.
+    // Everything the outgoing vault owns has to reach the database before its item objects
+    // are destroyed a few lines below.
+    //
+    // The obvious call for that, the core's full character save, is deliberately avoided. It
+    // quietly does nothing at all while a long-distance teleport is pending, and it does not
+    // even run the module's hook on the way out. Trusting it would mean destroying items whose
+    // changes were never written, or in the case of something looted seconds ago, destroying
+    // items that had never been written at all. The narrower inventory save used here has no
+    // such escape hatch.
     PersistOutgoingVault(player, current);
 
     std::vector<ExtendedBankItemPos> live;
@@ -718,22 +779,24 @@ bool ExtendedBankMgr::OpenVault(Player* player, uint8 target, ObjectGuid bankerG
         SyncSessionCount();
     }
 
-    // The bank slot GUID fields were only marked dirty; without an explicit flush they would
-    // ship at the end of the world tick, after the client has already drawn the bank frame
-    // with the previous vault's contents. Nothing changed when no swap happened, so the
-    // already-open vault -- including the default one -- takes the plain vanilla path.
+    // Swapping the slots only marked them as changed. Left alone they would reach the client
+    // at the end of the world tick, which is after the bank window has already been drawn, and
+    // the player would see the previous vault's contents for an instant. Pushing them now is
+    // what makes the switch look instantaneous. Reopening the vault that is already open
+    // changed nothing, so it takes the ordinary path instead.
     if (switching)
         player->SendUpdateToPlayer(player);
 
-    // Precautionary, NOT a verified fix. The stock banker option relies on the client closing
-    // the gossip frame itself when SMSG_SHOW_BANK arrives, and that does work here. But a bank
-    // frame opened behind a closing gossip frame was seen several times to come up with a
-    // stale bank bag slot count -- buying a slot then updated the display one purchase behind
-    // until the frame was reopened. The server's count was correct every time, so the effect
-    // was cosmetic. A controlled A/B afterwards could not reproduce it, so the cause is not
-    // established and this may be treating a symptom that has nothing to do with the gossip
-    // frame. Closing explicitly first is the fallback the original design named for exactly
-    // this, and it costs one packet, so it stays until someone reproduces the fault properly.
+    // Precautionary, and honestly not a proven fix. The stock banker never closes the gossip
+    // window explicitly; the client closes it by itself when the bank opens, and that works
+    // here too.
+    //
+    // But a bank window opening behind a closing gossip window was seen more than once to show
+    // a stale bank bag slot count, so buying a slot appeared to do nothing until the window was
+    // reopened. The server's count was right every time, so nothing was actually lost. A
+    // careful attempt to reproduce it afterwards failed, which means the cause is unknown and
+    // this line may be treating a symptom of something else entirely. It costs one packet, so
+    // it stays until somebody pins the fault down properly.
     player->PlayerTalkClass->SendCloseGossip();
 
     player->GetSession()->SendShowBank(bankerGuid);
@@ -760,14 +823,16 @@ void ExtendedBankMgr::FlushAndDetachForLogout(Player* player)
     if (active == EXTENDED_BANK_DEFAULT_VAULT)
         return;
 
-    // Reverting properly would reload the default vault's entire contents from
-    // character_inventory -- a blocking SELECT and up to ~280 Item constructions, plus
-    // AttachVault's mail-back path as a failure surface -- only for LogoutPlayer to destroy
-    // the Player moments later. All that is actually required is that the vault is persisted,
-    // its items are out of the update queue, the bank slots are empty so nothing can be
-    // mistaken for the default vault, and PLAYER_BYTES_2 carries the default vault's bag slot
-    // count when the character is saved. character_inventory still holds the default vault's
-    // rows untouched, so the next login restores it exactly as vanilla would.
+    // Logging out is the one case where the module does *not* put vault 1 back, and the
+    // reason is that it would be pure waste. A proper revert means a blocking query, building
+    // up to 280 item objects, and exposing the whole failure path that can post items to the
+    // player, all so the core can destroy the character a few milliseconds later.
+    //
+    // Only four things actually have to be true when the character record is written: the open
+    // vault is saved, its items are off the pending-write list, the bank slots are empty so
+    // nothing can be mistaken for vault 1, and the bag slot count belongs to vault 1 rather
+    // than to whatever was open. Vault 1's own rows were never touched, so the next login
+    // loads it exactly as it would without this module installed.
     PersistOutgoingVault(player, active);
 
     std::vector<ExtendedBankItemPos> live;
@@ -787,52 +852,53 @@ void ExtendedBankMgr::FlushAndDetachForLogout(Player* player)
 
 namespace
 {
-    // Two independent reasons an item may not live anywhere but the Main Vault, both of them
-    // the same shape: a stowed vault is invisible to a rule the game enforces elsewhere, so
-    // parking an item there would buy its owner something the game does not sell.
+    // Two kinds of item are refused from every vault except the first, for the same underlying
+    // reason. A vault that is not currently open is invisible to the rest of the server. Any
+    // rule the game enforces by looking at what a character is carrying stops applying to
+    // whatever is parked in one, so storing certain items there would hand their owner
+    // something the game does not otherwise sell.
     //
-    // Both are statements about what a realm considers an exploit rather than about how the
-    // storage works, so a realm is allowed to disagree with them -- see the bypass below and
-    // the disclaimer that comes with it in conf/mod_extended_bank.conf.dist.
+    // Neither rule is about how the storage works. Both are opinions about what counts as an
+    // exploit, which is a realm's decision rather than this module's, so there is a setting to
+    // switch them off. The config file argues the case at length.
     //
-    // 1. A capped item. The game enforces its cap by counting what is in character_inventory,
-    //    which a stowed vault is not part of, so a capped item parked in one would let its
-    //    owner acquire another.
+    // 1. Items the game only lets you have so many of: uniques, quest items, and anything in a
+    //    limited category. The game enforces those caps by counting what the character is
+    //    carrying, and a stowed vault is not part of that count, so parking one there lets the
+    //    owner go and acquire another.
     //
-    //    Written as the exact negation of the "no maximum" test in
-    //    Player::CanTakeMoreSimilarItems (PlayerStorage.cpp:818), sentinel and all: there,
-    //    MaxCount == 2147483647 means "no limit" even for an item that also carries an
-    //    ItemLimitCategory, so a predicate that read the two conditions independently would
-    //    evict an item the game does not in fact cap. No shipped template sits in that corner
-    //    -- both forms select the same 5802 rows -- but a custom one could.
+    //    The test below is deliberately the exact mirror image of the core's own "is this
+    //    capped?" check, sentinel value included. In the core, a maximum of 2147483647 means
+    //    "no limit at all", even on an item that also belongs to a limited category. Testing
+    //    the two conditions independently would therefore throw out items the game does not
+    //    actually cap. Nothing Blizzard shipped sits in that corner, but a custom item could.
     //
-    // 2. An item with a duration. Its clock is driven by Player::UpdateItemDuration over
-    //    m_itemDuration, and detaching a vault runs Player::RemoveItem, which calls
-    //    RemoveItemDurations -- so a stowed vault freezes the timer outright.
+    // 2. Items with a countdown. The clock only advances while the item is loaded, and stowing
+    //    a vault unloads it, so a stowed vault stops the timer outright.
     //
-    //    The tempting objection is that vanilla already pauses these: UpdateItemDuration is
-    //    called at login as UpdateItemDuration(time_diff, true) (PlayerStorage.cpp:5584), and
-    //    realtimeonly skips anything without ITEM_FLAGS_CU_DURATION_REAL_TIME, so an ordinary
-    //    duration item in the vanilla bank already stops ticking while its owner is logged
-    //    out. That misses what the two pauses cost. Vanilla's is paid for in playing time:
-    //    to stop the clock the player has to stop playing. A vault stops the same clock for
-    //    free, while they carry on. Same effect, no price -- which is the definition of the
-    //    thing this predicate exists to refuse, and it applies to every duration item, not
-    //    just the 70 real-time-flagged ones a narrower rule would have caught.
+    //    The obvious objection is that the game already does this: an item in a normal bank
+    //    stops ticking while the character is logged out. True, but it misses what each pause
+    //    costs. The game's pause is paid for in playing time, because stopping the clock means
+    //    stopping playing. A vault stops the same clock for nothing while its owner carries on,
+    //    and the item is still one banker visit away. Same benefit, no price, which is exactly
+    //    what this refusal exists to prevent. That argument holds for every item with a
+    //    countdown, not only for the handful whose timers run in real time.
     //
-    //    The template is authoritative rather than the live ITEM_FIELD_DURATION, because
-    //    Item::LoadFromDB forces the two into agreement anyway (Item.cpp:452).
+    //    The item template decides this rather than the item's own remaining time, because the
+    //    core forces the two to agree when it loads an item anyway.
     bool IsVaultRestricted(ItemTemplate const* proto)
     {
         if (!proto)
             return false;
 
-        // The realm's override. One line is the whole of it because every caller asks this one
-        // question and nothing branches on *why* an item was refused. Switching it back off
-        // needs no migration either: FlushLiveVault re-asks for the live vault on the first
-        // tick after it is opened, so each vault hands its offending items back the next time
-        // it is used -- the same path items already in a vault took when this rule was first
-        // introduced. What it cannot undo is a duplicate the bypass allowed to exist.
+        // The realm's override, and one line is genuinely the whole of it. Every caller asks
+        // this same question and nothing anywhere branches on *why* an item was refused, so
+        // turning the answer off turns the entire feature off.
+        //
+        // Switching it back on needs no migration either. Each vault re-checks its contents the
+        // first time it is opened, so offending items are handed back then, using the same path
+        // that cleared out vaults filled before this rule existed. The one thing no switch can
+        // undo is a duplicate that the bypass allowed somebody to create.
         if (sExtendedBankConfig.AllowRestrictedItems())
             return false;
 
@@ -862,10 +928,11 @@ namespace
 bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedBankItemPos> const& items,
     CharacterDatabaseTransaction trans, ObjectGuid bankerGuid)
 {
-    // A restricted *bag* drags its contents with it: they leave the bank inside it, so they
-    // must leave the vault's rows too. Without this they keep their vault rows while no longer
-    // being in the live bank, the rewrite below drops those rows, and nothing writes a
-    // character_inventory row for them -- silent loss. 36 shipped bag templates are capped.
+    // A refused bag takes its contents with it, so those contents have to be struck from the
+    // vault's rows as well. Without this they keep rows saying they are in a vault while no
+    // longer being in the bank, the rewrite further down deletes those rows, and nothing ever
+    // records where they went. The items are simply gone. Thirty-six of the bags Blizzard
+    // ships are refusable, so this is not a hypothetical.
     std::set<ObjectGuid::LowType> restrictedBags;
 
     for (ExtendedBankItemPos const& pos : items)
@@ -874,7 +941,7 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
 
     std::vector<Item*> rejected;
 
-    // Reverse order: a bag's contents must come out before the bag itself.
+    // Backwards, so a bag is emptied before the bag itself is taken out.
     for (auto itr = items.rbegin(); itr != items.rend(); ++itr)
     {
         bool const restricted = IsVaultRestricted(itr->ItemPtr->GetTemplate())
@@ -890,12 +957,14 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
     ChatHandler handler(player->GetSession());
     std::vector<Item*> mailed;
 
-    // Two names, not one, because the notice has to name an item that actually went where the
-    // notice says it went. A single name plus a "did anything mail" counter gets this wrong in
-    // one reachable combination: a capped *bag* drags its uncapped contents out with it, and if
-    // the bag fits back into the player's bags while a loose item from inside it does not, the
-    // counter is set by the loose item while the name comes from the bag -- so the whisper told
-    // the player their bag had been mailed while it was sitting in their bag panel.
+    // Two names rather than one, so that the message names an item which actually went where
+    // the message says it went.
+    //
+    // Tracking a single name plus a "did anything get mailed?" flag looks equivalent and is
+    // not. A refused bag drags its contents out with it, and if the bag fits back into the
+    // player's bags while one loose item from inside it does not, the flag gets set by the
+    // loose item while the name comes from the bag. The player is then told their bag was
+    // posted to them while they can see it sitting in their bag panel.
     std::string firstMailed;
     std::string firstRejected;
 
@@ -904,9 +973,10 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
         std::string const name = item->GetTemplate()->Name1;
         bool const capped = IsVaultRestricted(item->GetTemplate());
 
-        // Same shape as WorldSession::HandleAutoStoreBankItemOpcode. CanStoreItem applies the
-        // very cap that got the item rejected, so a player already holding the maximum gets it
-        // by mail rather than silently keeping it in the vault.
+        // Try the bags first, exactly as the core does when a player drags something out of
+        // the bank by hand. Note that this check applies the very cap that got the item
+        // refused in the first place, so somebody already carrying the maximum gets it posted
+        // to them instead of quietly keeping it in the vault.
         ItemPosCountVec dest;
         InventoryResult const err = player->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
 
@@ -925,18 +995,22 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
         }
         else
         {
-            // The item may still carry the character_inventory row it had before being put in
-            // the vault -- PersistVaultLayout has not run for it yet, and once it is in the
-            // mail it will never appear in a live bank again for that row to be cleaned up.
-            // Player::_LoadInventory does exactly this before mailing (PlayerStorage.cpp:6058);
-            // without it the item exists in mail_items and character_inventory at once.
+            // This item may still have a row saying it is in the character's inventory, left
+            // over from wherever it was before it was dropped into the vault. Normally that row
+            // is cleaned up when the vault is saved, but this item is about to go into the
+            // mail and will never appear in a bank again for that to happen.
+            //
+            // Delete it here or the item exists in the mail and in the inventory at the same
+            // time, which is a duplicate. The core does exactly this before posting an item it
+            // could not load.
             item->DeleteFromInventoryDB(trans);
             ReleaseItem(player, item);
 
             mailed.push_back(item);
 
-            // Not gated on `capped`: an uncapped item only reaches this branch by having been
-            // inside a capped bag, and it is just as gone from the bank as the bag is.
+            // Recorded even for an item that is not itself refused. The only way one of those
+            // reaches here is by having been inside a bag that was, and it is just as gone
+            // from the bank as the bag is, so the player still needs telling.
             if (firstMailed.empty())
                 firstMailed = name;
 
@@ -954,18 +1028,19 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
     MailItemsBack(player, mailed, trans,
         "Bank vault", "This item cannot be stored in that vault, please use the Main one.");
 
-    // A chat line is not enough. The item leaves the cursor and disappears from the bank in the
-    // same instant, which reads as item loss, and nobody is watching the chat frame mid-drag.
-    // Nothing here changes what was stored -- it only makes sure the player knows where the
-    // item went. See tools/TESTING.md for the swap-onto-an-occupied-slot route that reaches
-    // the mail case.
+    // The chat line above is not enough on its own. From the player's side, the item leaves
+    // the cursor and vanishes from the bank in the same instant, which looks exactly like
+    // losing it, and nobody is reading the chat frame in the middle of a drag. Nothing here
+    // changes what was stored. It only makes sure the player finds out where their item went.
     //
-    // A boss whisper is the whole mechanism. ChatHandler::SendNotification was tried alongside
-    // it and removed: observed in a stock client the two render almost identically, the whisper
-    // stays on screen longer, and the whisper is the one addons hook for an alert sound.
-    // Anything mailed is named first and named as mailed, because that is the case a player
-    // cannot see the answer to. Only when nothing was mailed does the notice fall back to the
-    // capped item that went into the bags, which the player can watch arrive.
+    // A whisper from the banker is the mechanism, sent in the style bosses use for their
+    // announcements. On a stock client that renders as a notice across the middle of the
+    // screen rather than as speech, stays up longer than the alternatives, and is the form
+    // addons already listen for to play an alert sound.
+    //
+    // Anything posted to the player is named first and named as posted, because that is the
+    // case they cannot work out for themselves. Only when nothing was mailed does this fall
+    // back to naming an item that went into their bags, which they can watch arrive.
     std::string const& subject = firstMailed.empty() ? firstRejected : firstMailed;
 
     if (!subject.empty())
@@ -974,8 +1049,9 @@ bool ExtendedBankMgr::EvictRestrictedItems(Player* player, std::vector<ExtendedB
             ? Acore::StringFormat("{} cannot be stored in this vault - use the Main one.", subject)
             : Acore::StringFormat("{} was sent to your mailbox - it cannot be stored in this vault.", subject);
 
-        // Skipped when the banker GUID is the player's own, which is the GM .bank convention
-        // and has no creature behind it -- then the chat line above is all there is.
+        // A GM can open a vault on themselves with no banker involved, in which case the
+        // "banker" is the player and there is no creature to speak. The chat line is then the
+        // only notice, which is fine for the one audience that gets it.
         if (bankerGuid && bankerGuid != player->GetGUID())
         {
             if (Creature* banker = ObjectAccessor::GetCreature(*player, bankerGuid))
@@ -994,13 +1070,16 @@ void ExtendedBankMgr::FlushLiveVault(Player* player, ExtendedBankSession& sessio
     uint8 const bagSlots = player->GetBankBagSlotCount();
     bool const restricted = AnyItemRestricted(live);
 
-    // The idle fast path, and the reason this function is shaped the way it is. It runs from
-    // OnPlayerUpdate on every tick and from CanPacketReceive on every packet, for as long as a
-    // vault is open -- and a player parked at a banker can hold that state open indefinitely,
-    // which `PreventAFKLogout = 2` turns from a contrivance into the ordinary case, since they
-    // cannot log out until they move. Everything below this point allocates: a transaction
-    // object, the eviction scan's set and vector, and the delta's hash map of up to 280
-    // entries. None of it may happen on a tick where nothing has changed.
+    // The early exit below is the reason this whole function is shaped the way it is.
+    //
+    // It runs on every server tick and on every packet the player sends, for as long as their
+    // vault stays open, and a player can leave one open indefinitely by standing still. On a
+    // realm that stops people logging out while away from keyboard, that stops being a
+    // contrived case and becomes the normal one.
+    //
+    // Everything past this point allocates: a transaction, the sets and vectors the eviction
+    // scan needs, and a hash map of up to 280 entries for the comparison. None of that may
+    // happen on a tick where nothing has changed.
     //
     // These four checks are exactly as strong as computing the delta and throwing it away,
     // which is what this used to do:
@@ -1008,8 +1087,8 @@ void ExtendedBankMgr::FlushLiveVault(Player* player, ExtendedBankSession& sessio
     //   - a bank layout cannot change without the core marking an item ITEM_CHANGED, so
     //     anything that moved *within* the vault is caught by AnyItemQueued;
     //   - an item that left the vault is queued but no longer in `live`, so AnyItemQueued
-    //     would miss it -- the size comparison is what catches that, and it is the case the
-    //     single-transaction flush exists for, so it must not be got wrong;
+    //     would miss it. The size comparison is what catches that, and since it is the exact
+    //     case the single-transaction save exists for, getting it wrong loses an item;
     //   - an item that entered is both queued and in `live`, and changes the size;
     //   - a purchased bag slot changes neither, hence the explicit comparison.
     if (!saveCoreInventory && !restricted
@@ -1043,24 +1122,28 @@ void ExtendedBankMgr::FlushLiveVault(Player* player, ExtendedBankSession& sessio
     if (!delta.Any() && !evicted && !AnyItemQueued(live) && !saveCoreInventory)
         return;
 
-    // An item that has left the vault since the last flush is about to lose its vault row,
-    // and only the core knows how to write the character_inventory row saying where it went.
-    // Without both in one transaction it belongs to neither table until the next periodic
-    // save, and a crash in that window strands it. This is rare -- it needs an actual move
-    // out of the bank -- so the cost of pulling in _SaveInventory is paid only then.
+    // An item that has left the vault is about to lose the row saying it was here, and only
+    // the core can write the row saying where it has gone instead. Unless both happen in one
+    // transaction the item belongs to neither table until the next routine save, and a crash
+    // inside that window strands it: the item still exists, but nothing points at it and only
+    // a GM can get it back.
+    //
+    // This needs somebody to actually drag something out of the bank, so it is rare, and the
+    // expense of involving the core's save is paid only when it happens.
     bool const itemLeftVault = !delta.Removed.empty();
 
-    // Writes only the rows the delta says changed. When it says none did, this just un-queues
-    // the vault's items and writes their item_instance changes -- which is the whole of what
-    // keeps the core from putting a vault item into character_inventory.
+    // Writes only the rows that changed. When none did, this still takes the vault's items off
+    // the core's pending-write list and records any change to the items themselves, which is
+    // the whole of what keeps a vault item out of the character's real inventory.
     PersistVaultLayout(player, session.ActiveVault, live, delta, trans);
 
     if (saveCoreInventory || itemLeftVault || evicted)
     {
-        // Whatever is still queued after PersistVaultLayout is by definition not in this
-        // vault -- most importantly an item just dragged OUT of it, whose new position only
-        // the core can record, and whose Item object the caller is about to free. Doing it in
-        // this transaction makes that move atomic with the vault rows it is leaving.
+        // Anything still waiting to be written at this point is, by definition, not in this
+        // vault any more. The important example is an item the player has just dragged out of
+        // it: only the core can record its new home, and the caller is about to destroy the
+        // object. Writing it inside this transaction is what makes leaving a vault a single
+        // atomic step rather than two.
         player->SaveInventoryAndGoldToDB(trans);
     }
 
@@ -1079,13 +1162,14 @@ void ExtendedBankMgr::DrainUpdateQueue(Player* player)
     if (itr == _sessions.end())
         return;
 
-    // Hot path: runs before every packet and every player tick. It deliberately does NOT call
-    // Player::SaveInventoryAndGoldToDB. Taking the vault's items out of the update queue is
-    // the entire requirement -- _SaveInventory returns early on an empty queue and writes
-    // nothing about items that are not in it. Pulling the core's inventory save in here as
-    // well would run its buyback purge, its position cheat-detection (which can mark an item
-    // ITEM_REMOVED) and its queue clear at arbitrary packet boundaries, hundreds of times a
-    // minute, for no gain.
+    // This runs before every single packet and on every player tick, so it is as hot as code
+    // in this module gets, and it deliberately does not involve the core's inventory save.
+    //
+    // Taking the vault's items off the pending-write list is the entire requirement. The core
+    // writes nothing about items it cannot see there, so that alone is the whole defence.
+    // Calling its save here as well would additionally purge vendor buyback slots, run a
+    // cheat check that can mark an item destroyed, and wipe the pending-write list, hundreds
+    // of times a minute, at arbitrary moments, for no benefit at all.
     FlushLiveVault(player, itr->second, false);
 }
 
@@ -1131,9 +1215,9 @@ void ExtendedBankMgr::UpdateRangeCheck(Player* player, uint32 diff)
 
     session.RangeCheckTimer = 0;
 
-    // A banker GUID equal to the player's own is the GM ".bank" case, which
-    // WorldSession::CanUseBank also special-cases -- there is no creature to be in range of,
-    // so range can never end the interaction. Map change and logout still revert it.
+    // A GM can open their own bank with no banker present, and the core recognises that by
+    // the "banker" being the player themselves. There is then no creature to walk away from,
+    // so distance can never end the visit. Changing map or logging out still does.
     if (session.BankerGuid == player->GetGUID())
         return;
 

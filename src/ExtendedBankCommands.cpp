@@ -6,13 +6,18 @@
  */
 
 /*
- * Debug commands. Every one is Console::Yes, so they can be driven over SOAP or the remote
- * console without a game client attached -- which is the only way to exercise a vault switch
- * from a test harness, since the normal route is a gossip click.
+ * The `.vault` commands, which exist for testing rather than for players.
  *
- * `.vault check` deliberately only asserts things that are invisible from SQL: live memory
- * against the database. The purely relational invariants live in tools/check_invariants.sql,
- * which does not need a running server.
+ * Every one of them is available from the server console as well as in game, and that is the
+ * point. The normal way to open a vault is to click a menu on an NPC, which no automated test
+ * can do, so without these there would be no way to exercise a vault switch from a script.
+ * With them, most of the test plan can be driven over a remote console with no game client
+ * running at all.
+ *
+ * `.vault check` is the interesting one. It deliberately only tests things that cannot be
+ * seen from SQL: whether the server's memory agrees with the database. Anything checkable by
+ * querying the database alone lives in tools/check_invariants.sql instead, which has the
+ * advantage of not needing a running server.
  */
 
 #include "ExtendedBank.h"
@@ -132,8 +137,9 @@ namespace
         ObjectGuid const guid = player->GetGUID();
         ObjectGuid::LowType const lowGuid = guid.GetCounter();
 
-        // One read, so the vault this function checks and the row-presence flag it checks it
-        // against cannot come from two different acquisitions of the manager's lock.
+        // Read once and reused below. Asking twice would take the manager's lock twice, and
+        // the answer could change in between, so the check would be comparing two different
+        // moments and could report a fault that never existed.
         ExtendedBankDebugState const state = sExtendedBankMgr->GetDebugState(guid);
         uint8 const active = state.ActiveVault;
         uint32 failures = 0;
@@ -141,9 +147,10 @@ namespace
         std::vector<ExtendedBankItemPos> live;
         sExtendedBankMgr->CollectLiveBankItems(player, live);
 
-        // 1. No live bank item may sit in the update queue while a module-owned vault is
-        //    loaded. If one does, Player::_SaveInventory will write it into
-        //    character_inventory and collide with the default vault's row for that slot.
+        // 1. While a vault other than the first is open, none of its items may be waiting to
+        //    be written by the core. If one is, the next inventory save writes it into the
+        //    character's real bank and destroys whatever vault 1 had in that slot. This is
+        //    the fault the entire module is built to prevent, so it is checked first.
         if (active != EXTENDED_BANK_DEFAULT_VAULT)
         {
             for (ExtendedBankItemPos const& pos : live)
@@ -157,7 +164,8 @@ namespace
             }
         }
 
-        // 2. The live bank must match whichever table owns the active vault, exactly.
+        // 2. What is actually in the bank slots must match what the database says is in this
+        //    vault, item for item and slot for slot. A mismatch means a write was lost.
         for (ExtendedBankItemPos const& pos : live)
         {
             ObjectGuid::LowType const item = pos.ItemPtr->GetGUID().GetCounter();
@@ -185,8 +193,9 @@ namespace
             }
         }
 
-        // 3. The reverse: nothing persisted for the active vault may be missing from the live
-        //    bank. Only meaningful for a module-owned vault, where the module owns the table.
+        // 3. The same comparison in the other direction, catching rows the database holds
+        //    that are not in the bank. Only meaningful for a vault the module owns, since
+        //    vault 1's rows belong to the core and are none of this module's business.
         if (active != EXTENDED_BANK_DEFAULT_VAULT)
         {
             uint32 const rows = CountVaultRows(lowGuid, active);
@@ -198,8 +207,9 @@ namespace
             }
         }
 
-        // 4. No item may exist in character_inventory and a vault at the same time. This is the
-        //    duplication vector, and the one thing the whole design exists to prevent.
+        // 4. No item may be listed in the character's inventory and in a vault at the same
+        //    time. That is how an item becomes two items, and preventing it is what the whole
+        //    design is for.
         if (QueryResult result = CharacterDatabase.Query(
             "SELECT v.vault, v.item FROM mod_extended_bank_vault_items v "
             "JOIN character_inventory ci ON ci.item = v.item WHERE v.owner_guid = {}", lowGuid))
@@ -213,13 +223,15 @@ namespace
             } while (result->NextRow());
         }
 
-        // 5. The live bank bag slot count must match what is stored for the active vault, or a
-        //    crash here would make the core mail that vault's bank bags back at next login.
-        //    A missing metadata row is only benign for the default vault on a character who
-        //    has never bought or opened one -- SwitchTo calls EnsureDefaultVaultRow, so anyone
-        //    who has switched has a row. For any other vault a missing row is itself the
-        //    fault: it is what stops LoadPlayer restoring PLAYER_BYTES_2, after which the core
-        //    mails that vault's bank bags back.
+        // 5. The number of bank bag slots the character currently has must match what is
+        //    recorded for the open vault. If it does not, a crash at this moment would leave
+        //    the character owning fewer slots than they have bags, and the core would post the
+        //    surplus bags to them at their next login.
+        //
+        //    A missing record is harmless in exactly one case: vault 1, on a character who has
+        //    never bought or opened a vault, because nothing has had reason to write one yet.
+        //    For any other vault a missing record is itself the fault, since it is what stops
+        //    the slot count being restored at login.
         if (!state.HasVaultRow && active != EXTENDED_BANK_DEFAULT_VAULT)
         {
             handler->PSendSysMessage("FAIL missing-vault-row: vault {} is open with no metadata row.",
@@ -256,9 +268,10 @@ namespace
         if (!player)
             return true;
 
-        // The player's own GUID as the banker is the GM ".bank" convention, which
-        // WorldSession::CanUseBank already special-cases. UpdateRangeCheck honours the same
-        // exception, so a vault opened this way stays loaded until a map change or logout.
+        // Naming the player themselves as the banker is the convention the core already uses
+        // for a GM opening their own bank with no NPC present. The range check honours the
+        // same exception, so a vault opened this way stays open until the character changes
+        // map or logs out, which is exactly what a test harness wants.
         if (!sExtendedBankMgr->OpenVault(player, vault, player->GetGUID()))
         {
             handler->PSendSysMessage("Refused: {} does not own vault {}, or the switch was blocked.",
@@ -270,8 +283,8 @@ namespace
         return true;
     }
 
-    // Forces the revert that normally fires on walking out of range, so the auto-revert path
-    // can be tested without waiting on a range check.
+    // Triggers by hand the revert that normally happens when a player walks away from the
+    // banker, so that path can be tested without scripting a character's movement.
     bool HandleVaultRevertCommand(ChatHandler* handler, Optional<PlayerIdentifier> target)
     {
         Player* player = ResolveTarget(handler, target);
@@ -287,8 +300,8 @@ namespace
         return true;
     }
 
-    // Forces the drain that normally runs before every packet, so its effect can be observed
-    // in isolation rather than as a side effect of whatever the client happened to send.
+    // Triggers by hand the drain that normally runs before every packet, so its effect can be
+    // measured on its own rather than mixed in with whatever else the client was sending.
     bool HandleVaultFlushCommand(ChatHandler* handler, Optional<PlayerIdentifier> target)
     {
         Player* player = ResolveTarget(handler, target);
@@ -300,7 +313,8 @@ namespace
         return true;
     }
 
-    // Same purchase the gossip option performs, including every refusal.
+    // Exactly the purchase the menu performs, refusals included, so the price table and the
+    // out-of-money and at-the-limit cases can be tested without a client.
     bool HandleVaultBuyCommand(ChatHandler* handler, Optional<PlayerIdentifier> target)
     {
         Player* player = ResolveTarget(handler, target);
@@ -321,14 +335,16 @@ namespace
         return true;
     }
 
-    // Takes the rest of the line verbatim, so colour codes and inline icons can be tested the
-    // way a player would type them, and so the length limit can be driven past its boundary.
+    // Takes the rest of the line exactly as typed, so colour codes and inline icons can be
+    // tested the way a player would enter them, and so the length limit can be pushed past its
+    // boundary on purpose.
     //
-    // The target is required and comes first: Tail has to be the last parameter, which leaves
-    // nowhere unambiguous to put an optional name -- it would swallow the first word of the
-    // new vault name instead.
-    // Reordering has no client-driven route a harness can reach -- it is a gossip click -- so
-    // this exists to make the menu order testable over SOAP alongside everything else.
+    // The character name is required here and comes first, unlike the other commands where it
+    // is optional. A parameter that swallows the rest of the line has to be last, which leaves
+    // nowhere unambiguous for an optional name to go: it would eat the first word of the new
+    // vault name instead.
+    // Reordering is a menu click and nothing else, so a harness has no way to reach it. This
+    // command exists purely so the menu order can be tested alongside everything else.
     bool HandleVaultMoveCommand(ChatHandler* handler, uint8 vault, Optional<PlayerIdentifier> target)
     {
         Player* player = ResolveTarget(handler, target);
@@ -363,8 +379,9 @@ namespace
         if (!player)
             return true;
 
-        // Reporting GetVaultName unconditionally used to invent a success: it synthesises
-        // "Vault N" for any number, so renaming a vault the character does not own printed
+        // Report what actually happened rather than what was asked for. This used to print
+        // the vault's name unconditionally, and since that function invents "Vault N" for any
+        // number you give it, renaming a vault the character did not own printed
         // `Vault 9 name is now 7 bytes: 'Vault 9'` while having written nothing at all.
         if (!sExtendedBankMgr->RenameVault(player, vault, std::string(name)))
         {
